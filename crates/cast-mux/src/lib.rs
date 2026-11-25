@@ -18,4 +18,4 @@ mod boxes;
 pub mod inspect;
 mod writer;
 
-pub use writer::{AudioTrack, Config, Summary, VideoTrack, Writer, AUDIO_TIMESCALE, VIDEO_TIMESCALE};
+pub use writer::{open_output, AudioTrack, Config, Summary, VideoTrack, Writer, AUDIO_TIMESCALE, VIDEO_TIMESCALE};

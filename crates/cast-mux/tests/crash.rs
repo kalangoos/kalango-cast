@@ -14,7 +14,10 @@ const PARAMS: &[u8] =
 fn scratch(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cast-mux");
     std::fs::create_dir_all(&dir).unwrap();
-    dir.join(name)
+    let path = dir.join(name);
+    // a fresh file each run (the writer refuses to replace anything it was not asked to)
+    let _ = std::fs::remove_file(&path);
+    path
 }
 
 fn config() -> Config {
@@ -31,7 +34,7 @@ fn config() -> Config {
 
 /// Writes `seconds` of 60 fps video (a keyframe every 2 s) and two 20 ms Opus tracks; returns the writer unfinished.
 fn record(path: &Path, seconds: u64) -> Writer {
-    let mut w = Writer::create(path, &config()).unwrap();
+    let mut w = Writer::create(path, &config(), true).unwrap();
     let mut sample = Vec::new();
     let frames = seconds * 60;
     let mut audio_at = 0u64;
@@ -56,6 +59,8 @@ fn record(path: &Path, seconds: u64) -> Writer {
 }
 
 fn ffprobe_packets(path: &Path, stream: &str) -> Option<(bool, u64, f64)> {
+    // a missing ffprobe is a failure, not a skip: the tests would pass without checking the file
+    assert!(Command::new("ffprobe").arg("-version").output().is_ok_and(|o| o.status.success()), "ffprobe is required (package ffmpeg)");
     let out = Command::new("ffprobe")
         .args([
             "-v",

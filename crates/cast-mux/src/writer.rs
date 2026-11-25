@@ -1,8 +1,11 @@
 //! The fragmented MP4 writer.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
+use std::ffi::CString;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 
 use cast_core::clock::ns_to_ticks;
@@ -106,6 +109,58 @@ pub struct Summary {
     pub bytes: u64,
 }
 
+/// Opens the output file safely: the folder must be a real directory (not a link) owned by this user; a new file
+/// is created exclusively (never through a link, mode 0600); an existing one is replaced only with `overwrite`, only if
+/// it is a regular file of this user with a single name that is empty or already an MP4 (`ftyp`), and it is
+/// checked on the open file (no check-then-open race), so `.bashrc` or a planted symlink are never truncated.
+pub fn open_output(path: &Path, overwrite: bool) -> io::Result<File> {
+    let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidInput, m.to_string());
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).ok_or_else(|| bad("the path has no folder"))?;
+    let name = path.file_name().ok_or_else(|| bad("the path has no file name"))?;
+    let cname = CString::new(name.as_bytes()).map_err(|_| bad("NUL in the file name"))?;
+    let cparent = CString::new(parent.as_os_str().as_bytes()).map_err(|_| bad("NUL in the folder name"))?;
+    // SAFETY: cparent is a NUL-terminated path; the returned fd (if any) is owned below.
+    let raw = unsafe { libc::open(cparent.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw is a fresh, valid fd that nothing else owns.
+    let dir = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    if dir.metadata()?.uid() != me {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the folder is not yours"));
+    }
+    let openat = |flags: libc::c_int| -> io::Result<File> {
+        // SAFETY: dir is an open directory fd, cname a NUL-terminated name; the fd returned is owned right away.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), cname.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600 as libc::c_uint) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is a fresh, valid fd that nothing else owns.
+        Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    };
+    match openat(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL) {
+        Ok(f) => return Ok(f),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && overwrite => {}
+        Err(e) => return Err(e),
+    }
+    let mut f = openat(libc::O_RDWR)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() || meta.uid() != me || meta.nlink() != 1 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not a regular file of yours with a single name"));
+    }
+    let mut head = [0u8; 8];
+    let n = f.read(&mut head)?;
+    if n != 0 && !(n == 8 && &head[4..8] == b"ftyp") {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the existing file is not an MP4 recording"));
+    }
+    f.set_len(0)?;
+    // the read above moved the offset: the new recording starts at byte 0, with no hole
+    f.seek(SeekFrom::Start(0))?;
+    Ok(f)
+}
+
 pub struct Writer {
     file: File,
     end: u64,
@@ -121,9 +176,15 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Creates the file and writes `ftyp` + `moov` (synced: an empty recording is already a valid file).
-    pub fn create(path: &Path, config: &Config) -> io::Result<Writer> {
-        let file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    /// Creates the file ([`open_output`]) and writes `ftyp` + `moov` (synced: an empty recording is already a valid
+    /// file).
+    pub fn create(path: &Path, config: &Config, overwrite: bool) -> io::Result<Writer> {
+        Self::from_file(open_output(path, overwrite)?, config)
+    }
+
+    /// Writes `ftyp` + `moov` to a file already opened for writing at its start (`create` for callers that opened
+    /// the file themselves, and for tests that need a failing disk).
+    pub fn from_file(file: File, config: &Config) -> io::Result<Writer> {
         let mut tracks = Vec::new();
         let mut id = 1;
         if config.video.is_some() {
