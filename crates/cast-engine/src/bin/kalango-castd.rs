@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cast_core::tr;
-use cast_engine::rpc::{self, Daemon};
+use cast_core::{tr, trf};
+use cast_engine::rpc::{self, Daemon, Event};
 
 /// Blocks SIGINT/SIGTERM in this thread (and the threads it starts afterwards), to wait for them with sigwait.
 fn block_signals() -> libc::sigset_t {
@@ -51,7 +51,24 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let daemon = Arc::new(Daemon::with_bus(bus));
+    // The trusted channel: what the person sees on this terminal. The approval code is shown here and nowhere else.
+    let hook = Box::new(|e: &Event| match e {
+        Event::ConsentRequested { what, token } => {
+            eprintln!(
+                "kalango-castd: {}",
+                trf(
+                    "Recording requested: {what}. To allow it, run: kalango-cast approve {token}",
+                    &[("what", what.clone()), ("token", token.clone())]
+                )
+            )
+        }
+        Event::RecordingStarted { path } => eprintln!("kalango-castd: {}", trf("RECORDING STARTED: {path}", &[("path", path.clone())])),
+        Event::RecordingStopped { path } => eprintln!("kalango-castd: {}", trf("recording stopped: {path}", &[("path", path.clone())])),
+        Event::RecordingFailed { path, error } => {
+            eprintln!("kalango-castd: {}", trf("RECORDING FAILED: {path}: {error}", &[("path", path.clone()), ("error", error.clone())]))
+        }
+    });
+    let daemon = Arc::new(Daemon::with_bus(bus).with_consent(rpc::load_consent()).with_hook(hook));
     let d = daemon.clone();
     std::thread::spawn(move || d.serve(listener));
     eprintln!("kalango-castd: {} {}", tr("listening on"), socket.display());

@@ -4,8 +4,10 @@
 //! One test, in order (one session for all): 3 s of a monitor with desktop + microphone sound (stand-in devices),
 //! the clap A/V sync measurement, a window, an area, and the daemon's JSON-RPC.
 //!
-//! Without `KALANGO_CAST_NIRI` it says so and passes (CI has no GPU nor display); on a developer machine it is the
-//! acceptance test: `KALANGO_CAST_NIRI=/path/to/niri cargo test -p cast-testkit --test niri_session -- --nocapture`.
+//! `#[ignore]`d (CI has no GPU nor display): on a developer machine it is the acceptance test, and it fails if
+//! `KALANGO_CAST_NIRI` is not set:
+//! `KALANGO_CAST_NIRI=/path/to/niri cargo test -p cast-testkit --test niri_session -- --ignored --nocapture`.
+//! (It runs the daemon with `consent = "allow"`: no person is there to approve.)
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -124,7 +126,7 @@ fn niri_session_end_to_end() {
     // 5. the daemon: record.start / status / stop over the socket
     let sock = d.join("rt").join("kalango").join("cast.sock");
     let listener = cast_engine::rpc::bind(&sock).unwrap();
-    let daemon = Arc::new(cast_engine::rpc::Daemon::with_bus(Some(session.dbus_address.clone())));
+    let daemon = Arc::new(cast_engine::rpc::Daemon::with_bus(Some(session.dbus_address.clone())).with_consent(cast_engine::rpc::Consent::Allow));
     let dm = daemon.clone();
     std::thread::spawn(move || dm.serve(listener));
     let rpc_mp4 = d.join("rpc.mp4");

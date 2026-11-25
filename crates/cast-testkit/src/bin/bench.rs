@@ -179,7 +179,19 @@ fn main() {
         let sinks =
             audio.then(|| (NullSink::create("kalango-cast-bench-desk").expect("sink"), NullSink::create("kalango-cast-bench-mic").expect("sink")));
         let mut cmd = Command::new(&cast);
-        cmd.args(["record", "--monitor", "winit", "--seconds", &seconds.to_string(), "--json", "--bus", &session.dbus_address, "--out"]).arg(&out);
+        cmd.args([
+            "record",
+            "--monitor",
+            "winit",
+            "--seconds",
+            &seconds.to_string(),
+            "--json",
+            "--bus",
+            &session.dbus_address,
+            "--overwrite",
+            "--out",
+        ])
+        .arg(&out);
         match &sinks {
             Some((d, m)) => {
                 cmd.args(["--desktop-sink", &d.name, "--mic-source", &m.name]);

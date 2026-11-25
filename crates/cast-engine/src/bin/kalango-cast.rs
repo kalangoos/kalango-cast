@@ -4,12 +4,13 @@
 //! kalango-cast record [--monitor CONECTOR | --window ID | --area CONECTOR:X,Y,LxA] [--seconds N] [--out ARQUIVO]
 //!                     [--encoder nvenc|openh264] [--codec h264|hevc] [--fps N] [--bitrate KBIT]
 //!                     [--no-desktop] [--no-mic] [--desktop-sink NOME] [--mic-source NOME] [--no-cursor]
-//!                     [--bus ENDEREÇO] [--json]
+//!                     [--bus ENDEREÇO] [--overwrite] [--json]
 //! kalango-cast sources [--bus ENDEREÇO]
 //! kalango-cast caps
 //! kalango-cast inspect ARQUIVO
 //! kalango-cast openh264 download
 //! kalango-cast rpc MÉTODO [JSON] [--socket CAMINHO]
+//! kalango-cast approve CÓDIGO [--socket CAMINHO]
 //! ```
 //! `record` runs the engine in this process (Ctrl+C stops early); `rpc` talks to kalango-castd.
 
@@ -49,6 +50,7 @@ fn record(args: &[String]) {
     let mut bus = None;
     let mut json = false;
     let mut cursor = true;
+    let mut overwrite = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().unwrap_or_else(|| usage());
@@ -73,6 +75,7 @@ fn record(args: &[String]) {
             "--desktop-sink" => desktop = Some(AudioChoice::Named(val())),
             "--mic-source" => mic = Some(AudioChoice::Named(val())),
             "--no-cursor" => cursor = false,
+            "--overwrite" => overwrite = true,
             "--bus" => bus = Some(val()),
             "--json" => json = true,
             _ => usage(),
@@ -89,6 +92,7 @@ fn record(args: &[String]) {
     let out = out.unwrap_or_else(|| PathBuf::from(format!("kalango-cast-{}.mp4", std::process::id())));
     let out = if out.is_absolute() { out } else { std::env::current_dir().unwrap_or_default().join(out) };
     let mut o = RecordOptions::new(source, out.clone());
+    o.overwrite = overwrite;
     o.encoder = encoder;
     o.codec = codec;
     o.fps = fps;
@@ -239,6 +243,21 @@ fn main() {
             match cast_encode::openh264::download::fetch(&dir) {
                 Ok(p) => eprintln!("{}: {}", tr("Verified and installed"), p.display()),
                 Err(e) => fail(e),
+            }
+        }
+        "approve" => {
+            let token = rest.first().unwrap_or_else(|| usage());
+            let socket = rest
+                .iter()
+                .position(|a| a == "--socket")
+                .and_then(|i| rest.get(i + 1))
+                .map(PathBuf::from)
+                .or_else(cast_engine::rpc::default_socket)
+                .unwrap_or_else(|| fail("XDG_RUNTIME_DIR"));
+            match cast_engine::rpc::request(&socket, "consent.approve", serde_json::json!({"token": token})) {
+                Ok(v) if v.get("error").is_none() => eprintln!("{}", tr("Approved: the held recording may start now (ask the program to try again)")),
+                Ok(v) => fail(v["error"]["message"].as_str().unwrap_or("error")),
+                Err(e) => fail(format!("{}: {e}", socket.display())),
             }
         }
         "rpc" => {

@@ -15,5 +15,15 @@
   "encode failed": "falha ao codificar",
   "kalango-castd is already running": "o kalango-castd já está rodando",
   "sound not recorded": "som não gravado",
-  "the folder must be yours and closed to others (0700)": "a pasta precisa ser sua e fechada para os outros (0700)"
+  "the folder must be yours and closed to others (0700)": "a pasta precisa ser sua e fechada para os outros (0700)",
+  "exists and is not a socket: not removing it": "existe e não é um socket: não vou apagar",
+  "The path must not contain ..": "O caminho não pode conter ..",
+  "The path must end in .mp4": "O caminho precisa terminar em .mp4",
+  "Invalid or expired approval code": "Código de aprovação inválido ou expirado",
+  "Too many connections": "Conexões demais",
+  "Request too long": "Pedido longo demais",
+  "Recording requested: {what}. To allow it, run: kalango-cast approve {token}": "Gravação pedida: {what}. Para permitir, rode: kalango-cast approve {token}",
+  "RECORDING STARTED: {path}": "GRAVAÇÃO INICIADA: {path}",
+  "recording stopped: {path}": "gravação encerrada: {path}",
+  "RECORDING FAILED: {path}: {error}": "A GRAVAÇÃO FALHOU: {path}: {error}"
 }
