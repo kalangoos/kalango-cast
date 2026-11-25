@@ -11,7 +11,24 @@ Este repositório tem, por enquanto, o **motor** (fase 1): grava um monitor, uma
 do computador e o microfone, num MP4 que sobrevive a quedas. A interface do estúdio (os desenhos estão no Design
 System do KalangoOS, página "34 · Kalango Cast") vem nas próximas fases.
 
-## O que já faz
+## Estado real (leia primeiro)
+
+O código compila e passa no `clippy -D warnings` e nos testes de unidade. Pouco mais que isso foi **executado**:
+
+| O quê | Estado |
+|---|---|
+| `cargo check`, `clippy --all-targets -D warnings`, `fmt` | passam |
+| Testes de unidade (relógio, tipos, MP4, conversão, OpenH264 sem rede, serviço) | passam, no disco local |
+| NVENC H.264 e HEVC numa RTX 3090, sem tela (teste `#[ignore]`, `KALANGO_CAST_GPU=1`) | **rodou**, com quadros sintéticos de memória compartilhada (não DMA-BUF): 1080p, ~130–150 quadros/s no total, `encode()` p50 5–6 ms; as saídas foram conferidas só por estrutura (quadros não vazios, IDR, IDR forçado), **não decodificadas** |
+| Captura do niri (ScreenCast, DMA-BUF), PipeWire, som, MP4 gravado de ponta a ponta | **nunca executado** (precisa do niri com o patch de `tests/niri/` e de uma tela) |
+| Sincronia de áudio e vídeo, latência de ponta a ponta, uso de CPU/GPU em gravação real | **nunca medidos**; `docs/DESEMPENHO.md` descreve o método, não resultados |
+| VA-API (AMD, Intel), OpenH264 | só a detecção do VA-API existe; o OpenH264 não foi rodado (o download conferido tem teste `#[ignore]`, `KALANGO_CAST_OPENH264_NET=1`) |
+
+Testes que dependem de máquina, rede ou compositor são `#[ignore]` e dizem a variável de ambiente que os liga:
+`KALANGO_CAST_GPU` (NVENC), `KALANGO_CAST_OPENH264_NET` (download), `KALANGO_CAST_NIRI` (sessão completa).
+A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, não o que foi verificado.
+
+## O que o código foi escrito para fazer
 
 - **Captura pela API de ScreenCast do niri** (`org.gnome.Mutter.ScreenCast`, como o shell do KalangoOS faz): monitor,
   janela ou área. Os quadros chegam por **DMA-BUF com modificadores explícitos** (ficam na memória da GPU; o fd é
