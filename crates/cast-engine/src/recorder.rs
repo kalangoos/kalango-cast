@@ -49,6 +49,9 @@ pub struct RecordOptions {
     pub dbus_address: Option<String>,
     #[serde(default = "default_cursor")]
     pub cursor: bool,
+    /// Replace an existing recording of ours at `path` (never any other file; see `cast_mux::open_output`).
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 fn default_codec() -> VideoCodec {
@@ -76,6 +79,7 @@ impl RecordOptions {
             mic: Some(AudioChoice::Default),
             dbus_address: None,
             cursor: true,
+            overwrite: false,
         }
     }
 
@@ -130,7 +134,19 @@ enum MuxMsg {
     Finish,
 }
 
+/// A keyframe every 2 s of media time, which is also the MP4 fragment length.
 const KEYFRAME_NS: u64 = 2_000_000_000;
+
+/// Is a keyframe due for a frame at `pts_ns`, the last one having been at `last_key_pts_ns`?
+fn keyframe_due(last_key_pts_ns: Option<u64>, pts_ns: u64) -> bool {
+    last_key_pts_ns.is_none_or(|k| pts_ns >= k + KEYFRAME_NS)
+}
+
+/// Hands a message to the writer thread without ever blocking (the capture callbacks must not wait on the disk):
+/// false when the queue is full or the writer is gone, and the caller counts a drop.
+fn offer(tx: &SyncSender<MuxMsg>, msg: MuxMsg) -> bool {
+    tx.try_send(msg).is_ok()
+}
 
 /// What the video thread tells the recorder once the encoder is up (or failed).
 type Opened = Result<(EncoderInfo, u32, u32), String>;
@@ -210,6 +226,9 @@ impl VideoSink for VideoState {
     }
 
     fn frame(&mut self, frame: &VideoFrame, received_ns: u64) {
+        if self.counters.failed.load(Ordering::Acquire) {
+            return;
+        }
         let Some(enc) = self.encoder.as_mut() else { return };
         let pts = self.clock.media_ns(received_ns);
         if pts < 0 {
@@ -218,7 +237,7 @@ impl VideoSink for VideoState {
         let t0 = monotonic_ns();
         // a keyframe every 2 s of media time (frames come at a variable rate: a still screen sends few, so the
         // encoders' own GOP is off and the keyframes, which start the MP4 fragments, go by time)
-        if self.last_key_pts.is_none_or(|k| pts as u64 >= k + KEYFRAME_NS) {
+        if keyframe_due(self.last_key_pts, pts as u64) {
             enc.force_keyframe();
         }
         if let Err(e) = enc.encode(frame, self.crop, pts as u64, &mut self.out) {
@@ -240,10 +259,17 @@ impl VideoSink for VideoState {
         if key {
             self.last_key_pts = Some(pts as u64);
         }
-        self.counters.video_bytes.fetch_add(sample.len() as u64, Ordering::Relaxed);
-        self.counters.last_pts_ns.store(pts as u64, Ordering::Relaxed);
-        self.counters.tick_frame(t1);
-        let _ = self.mux.send(MuxMsg::Video { data: sample, pts_ns: pts as u64, key, arrived_ns: received_ns });
+        let bytes = sample.len() as u64;
+        if offer(&self.mux, MuxMsg::Video { data: sample, pts_ns: pts as u64, key, arrived_ns: received_ns }) {
+            self.counters.video_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.counters.last_pts_ns.store(pts as u64, Ordering::Relaxed);
+            self.counters.tick_frame(t1);
+        } else {
+            // the writer cannot keep up: drop the frame and restart from a keyframe, so the next frames never
+            // refer to the one that was lost
+            self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            self.last_key_pts = None;
+        }
     }
 
     fn skipped(&mut self) {
@@ -284,9 +310,13 @@ impl AudioState {
                     let start = t.timeline.start_ns().unwrap_or(0).max(0) as u64;
                     let pts = start + t.packets * 20_000_000;
                     t.packets += 1;
-                    self.counters.audio_packets.fetch_add(1, Ordering::Relaxed);
-                    self.counters.audio_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    let _ = self.mux.send(MuxMsg::Audio { track: index, data, pts_ns: pts });
+                    let bytes = data.len() as u64;
+                    if offer(&self.mux, MuxMsg::Audio { track: index, data, pts_ns: pts }) {
+                        self.counters.audio_packets.fetch_add(1, Ordering::Relaxed);
+                        self.counters.audio_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    } else {
+                        self.counters.audio_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 t.pending.clear();
             }
@@ -299,6 +329,9 @@ static SILENCE: [f32; FRAME_SAMPLES * 2] = [0.0; FRAME_SAMPLES * 2];
 
 impl AudioSink for AudioState {
     fn samples(&mut self, index: usize, pcm: &[f32], frames: usize, first_ns: i64) {
+        if self.counters.failed.load(Ordering::Acquire) {
+            return;
+        }
         let Some(t) = self.tracks.get_mut(index) else { return };
         let media = first_ns - self.clock.origin_ns() as i64;
         let ch = cast_capture::audio::CHANNELS;
@@ -325,45 +358,93 @@ impl AudioSink for AudioState {
     }
 }
 
+/// Opens the writer once the video track is known.
+type Opener = Box<dyn FnOnce(&cast_mux::Config) -> std::io::Result<Writer> + Send>;
+
+/// The file cannot be written: remember why (visible in `Status::error`), tell the capture threads to stop, and drop
+/// the writer without finishing it (what is on disk stays playable up to its last complete fragment).
+fn fail_mux(e: String, failure: &mut Option<String>, error: &Mutex<Option<String>>, counters: &Counters, writer: &mut Option<Writer>) {
+    counters.failed.store(true, Ordering::Release);
+    if let Ok(mut slot) = error.lock() {
+        slot.get_or_insert_with(|| e.clone());
+    }
+    failure.get_or_insert(e);
+    *writer = None;
+}
+
 fn mux_thread(
-    path: PathBuf,
+    open: Opener,
     audio: Vec<AudioTrack>,
     rx: Receiver<MuxMsg>,
     recycle_video: Sender<Vec<u8>>,
     recycle_audio: Sender<Vec<u8>>,
     counters: Arc<Counters>,
+    error: Arc<Mutex<Option<String>>>,
 ) -> Result<Summary, String> {
+    let mut open = Some(open);
     let mut writer: Option<Writer> = None;
+    let mut failure: Option<String> = None;
     // audio that comes before the video track is known (the encoder opens on the first format)
     let mut early: VecDeque<(usize, Vec<u8>, u64)> = VecDeque::new();
     let mut fragments_seen = 0;
+    // After a failure the loop keeps draining, so the capture side never blocks and buffers keep cycling.
     for msg in rx {
-        match msg {
-            MuxMsg::Start(video) => {
-                let config = cast_mux::Config { video: Some(video), audio: audio.clone(), fragment_ns: 2_000_000_000, sync: true };
-                let mut w = Writer::create(&path, &config).map_err(|e| format!("{}: {e}", path.display()))?;
-                for (track, data, pts) in early.drain(..) {
-                    w.write_audio(track, &data, pts, FRAME_SAMPLES as u32).map_err(|e| e.to_string())?;
+        if failure.is_some() {
+            match msg {
+                MuxMsg::Finish => break,
+                MuxMsg::Video { data, .. } => {
+                    let _ = recycle_video.send(data);
+                }
+                MuxMsg::Audio { data, .. } => {
                     let _ = recycle_audio.send(data);
                 }
-                writer = Some(w);
+                MuxMsg::Start(_) => {}
+            }
+            continue;
+        }
+        match msg {
+            MuxMsg::Start(video) => {
+                let config = cast_mux::Config { video: Some(video), audio: audio.clone(), fragment_ns: KEYFRAME_NS, sync: true };
+                let Some(open) = open.take() else { continue };
+                match open(&config) {
+                    Ok(mut w) => {
+                        let mut result = Ok(());
+                        for (track, data, pts) in early.drain(..) {
+                            if result.is_ok() {
+                                result = w.write_audio(track, &data, pts, FRAME_SAMPLES as u32);
+                            }
+                            let _ = recycle_audio.send(data);
+                        }
+                        match result {
+                            Ok(()) => writer = Some(w),
+                            Err(e) => fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer),
+                        }
+                    }
+                    Err(e) => fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer),
+                }
             }
             MuxMsg::Video { data, pts_ns, key, arrived_ns } => {
                 if let Some(w) = writer.as_mut() {
-                    w.write_video(&data, pts_ns, key).map_err(|e| e.to_string())?;
-                    let d = monotonic_ns().saturating_sub(arrived_ns);
-                    Counters::add_max(&counters.disk_ns_sum, &counters.disk_ns_max, d);
-                    counters.disk_samples.fetch_add(1, Ordering::Relaxed);
-                    if key {
-                        fragments_seen += 1;
-                        counters.fragments.store(fragments_seen, Ordering::Relaxed);
+                    match w.write_video(&data, pts_ns, key) {
+                        Ok(()) => {
+                            let d = monotonic_ns().saturating_sub(arrived_ns);
+                            Counters::add_max(&counters.disk_ns_sum, &counters.disk_ns_max, d);
+                            counters.disk_samples.fetch_add(1, Ordering::Relaxed);
+                            if key {
+                                fragments_seen += 1;
+                                counters.fragments.store(fragments_seen, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) => fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer),
                     }
                 }
                 let _ = recycle_video.send(data);
             }
             MuxMsg::Audio { track, data, pts_ns } => match writer.as_mut() {
                 Some(w) => {
-                    w.write_audio(track, &data, pts_ns, FRAME_SAMPLES as u32).map_err(|e| e.to_string())?;
+                    if let Err(e) = w.write_audio(track, &data, pts_ns, FRAME_SAMPLES as u32) {
+                        fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer);
+                    }
                     let _ = recycle_audio.send(data);
                 }
                 None if early.len() < 2000 => early.push_back((track, data, pts_ns)),
@@ -372,8 +453,15 @@ fn mux_thread(
             MuxMsg::Finish => break,
         }
     }
+    if let Some(e) = failure {
+        return Err(e);
+    }
     match writer {
-        Some(w) => w.finish().map_err(|e| e.to_string()),
+        Some(w) => w.finish().map_err(|e| {
+            let e = e.to_string();
+            fail_mux(e.clone(), &mut None, &error, &counters, &mut None);
+            e
+        }),
         None => Err(tr("No video frame arrived").into()),
     }
 }
@@ -387,6 +475,25 @@ impl Recorder {
         if options.path.parent().is_none_or(|p| !p.is_dir()) {
             return Err(trf("The folder {path} does not exist", &[("path", options.path.parent().unwrap_or(&options.path).display().to_string())]));
         }
+        // the file is opened (safely, exclusively) before anything else is started: a path that cannot be written
+        // fails here, not minutes into a recording
+        let file = cast_mux::open_output(&options.path, options.overwrite).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                tr("The file already exists").to_string()
+            } else {
+                format!("{}: {e}", options.path.display())
+            }
+        })?;
+        let path = options.path.clone();
+        Self::start_with_file(options, file).inspect_err(|_| {
+            // nothing was recorded: do not leave an empty file behind
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+                let _ = std::fs::remove_file(&path);
+            }
+        })
+    }
+
+    fn start_with_file(options: RecordOptions, file: std::fs::File) -> Result<Recorder, String> {
         let caps = cast_encode::probe();
         let kind = cast_encode::choose(&caps, options.encoder, options.codec).ok_or_else(|| {
             let why: Vec<String> = caps.iter().filter_map(|c| c.reason.as_ref().map(|r| format!("{}: {r}", c.kind.name()))).collect();
@@ -421,11 +528,12 @@ impl Recorder {
         let (mux_tx, mux_rx) = mpsc::sync_channel::<MuxMsg>(512);
         let (video_pool, recycle_video) = Pool::new(256 << 10);
         let (audio_pool, recycle_audio) = Pool::new(2 << 10);
-        let path = options.path.clone();
         let c2 = counters.clone();
+        let e2 = error.clone();
+        let open: Opener = Box::new(move |config| Writer::from_file(file, config));
         let mux = std::thread::Builder::new()
             .name("cast-mux".into())
-            .spawn(move || mux_thread(path, audio_tracks, mux_rx, recycle_video, recycle_audio, c2))
+            .spawn(move || mux_thread(open, audio_tracks, mux_rx, recycle_video, recycle_audio, c2, e2))
             .map_err(|e| e.to_string())?;
 
         let (opened_tx, opened_rx) = mpsc::channel::<Opened>();
@@ -514,7 +622,7 @@ impl Recorder {
         let disk_n = c.disk_samples.load(Ordering::Relaxed).max(1);
         let (gpu, enc) = self.nvml.as_ref().map(|n| n.sample()).unwrap_or((None, None));
         Status {
-            recording: self.video.is_some(),
+            recording: self.video.is_some() && !c.failed.load(Ordering::Acquire),
             path: self.options.path.display().to_string(),
             encoder: self.info.kind.name().into(),
             codec: format!("{:?}", self.info.codec).to_lowercase(),
@@ -527,6 +635,7 @@ impl Recorder {
             frames,
             fps: c.fps_window.lock().map(|w| w.2).unwrap_or(0.0),
             dropped: c.dropped.load(Ordering::Relaxed),
+            audio_dropped: c.audio_dropped.load(Ordering::Relaxed),
             bitrate_kbps: (c.video_bytes.load(Ordering::Relaxed) + c.audio_bytes.load(Ordering::Relaxed)) as f64 * 8.0 / elapsed / 1000.0,
             audio_tracks: self.audio_tracks,
             audio_packets: c.audio_packets.load(Ordering::Relaxed),
@@ -558,5 +667,141 @@ impl Recorder {
         let _ = self.mux_tx.send(MuxMsg::Finish);
         let summary = self.mux.take().map(|m| m.join().unwrap_or_else(|_| Err("mux thread panicked".into()))).unwrap_or(Err(String::new()))?;
         Ok((summary, status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::FromRawFd;
+    use std::time::{Duration, Instant};
+
+    const PARAMS: &[u8] =
+        &[0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0x84, 0, 0, 0, 1, 0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0];
+
+    fn track() -> VideoTrack {
+        VideoTrack { codec: VideoCodec::H264, width: 1920, height: 1080, config: avc::avcc(PARAMS).unwrap() }
+    }
+
+    fn video(pts_ms: u64, key: bool) -> MuxMsg {
+        MuxMsg::Video { data: vec![if key { 0x65 } else { 0x41 }; 64], pts_ns: pts_ms * 1_000_000, key, arrived_ns: monotonic_ns() }
+    }
+
+    #[test]
+    fn keyframes_come_every_two_seconds_of_media_time() {
+        assert!(keyframe_due(None, 0), "the first frame");
+        assert!(!keyframe_due(Some(0), 1_999_999_999));
+        assert!(keyframe_due(Some(0), 2_000_000_000));
+        assert!(!keyframe_due(Some(5_000_000_000), 6_999_999_999));
+        assert!(keyframe_due(Some(5_000_000_000), 7_000_000_000));
+        assert_eq!(KEYFRAME_NS, 2_000_000_000);
+    }
+
+    #[test]
+    fn a_full_queue_drops_instead_of_blocking_the_capture_callback() {
+        let (tx, rx) = mpsc::sync_channel::<MuxMsg>(2);
+        let t = Instant::now();
+        let accepted = (0..100).filter(|i| offer(&tx, video(*i, false))).count();
+        assert_eq!(accepted, 2, "only the queue's capacity is taken");
+        assert!(t.elapsed() < Duration::from_millis(500), "it never waited");
+        drop(rx);
+        assert!(!offer(&tx, video(0, true)), "a writer that is gone is a drop too");
+    }
+
+    struct Rig {
+        tx: SyncSender<MuxMsg>,
+        mux: JoinHandle<Result<Summary, String>>,
+        counters: Arc<Counters>,
+        error: Arc<Mutex<Option<String>>>,
+        /// The memfd the writer writes to (to seal it: a disk that stops accepting data).
+        file: Arc<Mutex<Option<std::fs::File>>>,
+        opened: Receiver<()>,
+    }
+
+    fn rig(open_dev_full: bool) -> Rig {
+        let (tx, rx) = mpsc::sync_channel::<MuxMsg>(2);
+        let (rv, _) = mpsc::channel();
+        let (ra, _) = mpsc::channel();
+        let counters = Arc::new(Counters::default());
+        let error = Arc::new(Mutex::new(None));
+        let file = Arc::new(Mutex::new(None));
+        let (otx, opened) = mpsc::channel();
+        let slot = file.clone();
+        let open: Opener = Box::new(move |config| {
+            let f = if open_dev_full {
+                std::fs::OpenOptions::new().write(true).open("/dev/full")?
+            } else {
+                // SAFETY: memfd_create with a static NUL-terminated name; the fd is owned by the File made from it.
+                let fd = unsafe { libc::memfd_create(c"cast-test".as_ptr(), libc::MFD_ALLOW_SEALING) };
+                assert!(fd >= 0);
+                // SAFETY: fd is a fresh valid descriptor nothing else owns.
+                unsafe { std::fs::File::from_raw_fd(fd) }
+            };
+            *slot.lock().unwrap() = Some(f.try_clone()?);
+            let w = Writer::from_file(f, config);
+            let _ = otx.send(());
+            w
+        });
+        let (c2, e2) = (counters.clone(), error.clone());
+        let mux = std::thread::spawn(move || mux_thread(open, vec![], rx, rv, ra, c2, e2));
+        Rig { tx, mux, counters, error, file, opened }
+    }
+
+    fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Floods the queue from another thread; fails the test if the writer thread stops draining.
+    fn flood_must_not_block(tx: SyncSender<MuxMsg>) {
+        let h = std::thread::spawn(move || {
+            for i in 0..200 {
+                tx.send(video(10_000 + i, false)).unwrap();
+                tx.send(MuxMsg::Audio { track: 0, data: vec![1; 8], pts_ns: i * 20_000_000 }).unwrap();
+            }
+        });
+        wait_for("the writer to keep draining after a failure", || h.is_finished().then_some(()));
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn a_write_error_midway_is_reported_and_the_queue_keeps_draining() {
+        let r = rig(false);
+        r.tx.send(MuxMsg::Start(track())).unwrap();
+        r.opened.recv_timeout(Duration::from_secs(5)).unwrap();
+        // the disk stops accepting data (a sealed memfd refuses writes, like a full disk)
+        {
+            let f = r.file.lock().unwrap();
+            let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+            // SAFETY: F_ADD_SEALS on a memfd we own, with a plain int argument.
+            assert_eq!(unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(f.as_ref().unwrap()), libc::F_ADD_SEALS, seals) }, 0);
+        }
+        // a keyframe after 2.1 s closes the first fragment, which must now be written
+        r.tx.send(video(0, true)).unwrap();
+        r.tx.send(video(2_100, true)).unwrap();
+        let why = wait_for("the error", || r.error.lock().unwrap().clone());
+        assert!(!why.is_empty());
+        assert!(r.counters.failed.load(Ordering::Acquire), "capture is told to stop");
+        flood_must_not_block(r.tx.clone());
+        r.tx.send(MuxMsg::Finish).unwrap();
+        let res = r.mux.join().unwrap();
+        assert_eq!(res.unwrap_err(), why, "stop() reports the same error");
+    }
+
+    #[test]
+    fn a_disk_that_refuses_the_file_header_fails_the_recording_visibly() {
+        let r = rig(true);
+        r.tx.send(MuxMsg::Start(track())).unwrap();
+        let why = wait_for("the error", || r.error.lock().unwrap().clone());
+        assert!(why.to_lowercase().contains("space"), "{why}");
+        flood_must_not_block(r.tx.clone());
+        r.tx.send(MuxMsg::Finish).unwrap();
+        assert!(r.mux.join().unwrap().is_err());
     }
 }

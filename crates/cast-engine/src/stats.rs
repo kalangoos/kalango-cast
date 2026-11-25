@@ -31,6 +31,10 @@ pub struct Counters {
     pub last_pts_ns: AtomicU64,
     pub dmabuf: AtomicBool,
     pub fragments: AtomicU64,
+    /// The file can no longer be written (full disk, I/O error): capture and encoding stop, the error is in `Status`.
+    pub failed: AtomicBool,
+    /// Audio packets dropped because the writer's queue was full.
+    pub audio_dropped: AtomicU64,
     /// Frames in the last full second, and the second it was counted in.
     pub fps_window: Mutex<(u64, u64, f64)>,
 }
@@ -74,6 +78,7 @@ pub struct Status {
     /// Frames per second over the last second.
     pub fps: f64,
     pub dropped: u64,
+    pub audio_dropped: u64,
     pub bitrate_kbps: f64,
     pub audio_tracks: u32,
     pub audio_packets: u64,
