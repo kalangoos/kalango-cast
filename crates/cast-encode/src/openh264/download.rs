@@ -5,7 +5,9 @@
 //! download is checked against SHA-256 pins compiled in here (the compressed file and the library inside it), and the
 //! library is checked again every time it is loaded.
 
+use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -31,6 +33,8 @@ pub const RELEASE: Release = Release {
 
 /// Most a download may be (the real one is ~0.6 MB): a server sending more is refused.
 const MAX_DOWNLOAD: u64 = 16 << 20;
+/// Most the unpacked library, or one read back from disk, may be (the real one is ~1.5 MB).
+const MAX_LIBRARY: u64 = 64 << 20;
 
 #[derive(Debug)]
 pub enum DownloadError {
@@ -39,6 +43,8 @@ pub enum DownloadError {
     /// The bytes do not match the pin (expected, got).
     Mismatch(&'static str, String),
     Decompress(String),
+    /// More bytes than the limit.
+    TooBig,
 }
 
 impl std::fmt::Display for DownloadError {
@@ -48,6 +54,7 @@ impl std::fmt::Display for DownloadError {
             DownloadError::Http(e) => write!(f, "{e}"),
             DownloadError::Mismatch(want, got) => write!(f, "SHA-256 {got} ≠ {want}"),
             DownloadError::Decompress(e) => write!(f, "bzip2: {e}"),
+            DownloadError::TooBig => write!(f, "too big"),
         }
     }
 }
@@ -72,24 +79,62 @@ pub fn cache_dir() -> Option<PathBuf> {
     Some(base.join("kalango-cast").join("openh264"))
 }
 
+/// Reads at most `max` bytes; more is an error (never a silently truncated read).
+fn read_limited(r: impl Read, max: u64) -> Result<Vec<u8>, DownloadError> {
+    let mut v = Vec::new();
+    r.take(max + 1).read_to_end(&mut v)?;
+    if v.len() as u64 > max {
+        return Err(DownloadError::TooBig);
+    }
+    Ok(v)
+}
+
+/// Opens `path` once, reads it, and returns its bytes only if their SHA-256 is `pin`: what was hashed is what the
+/// caller gets, so nothing can be swapped between the check and the use (load these bytes, not the path:
+/// [`memfd_copy`]).
+pub fn read_checked(path: &Path, pin: &str) -> Option<Vec<u8>> {
+    let data = read_limited(File::open(path).ok()?, MAX_LIBRARY).ok()?;
+    (sha256_hex(&data) == pin).then_some(data)
+}
+
+/// An anonymous in-memory file holding `bytes` (for `dlopen("/proc/self/fd/N")`): the library that is loaded is
+/// exactly the bytes that were verified, whatever happens to the file on disk afterwards.
+pub fn memfd_copy(bytes: &[u8]) -> io::Result<File> {
+    // SAFETY: memfd_create with a static NUL-terminated name.
+    let fd = unsafe { libc::memfd_create(c"kalango-cast-openh264".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh valid descriptor that nothing else owns.
+    let mut f = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    f.write_all(bytes)?;
+    Ok(f)
+}
+
 /// The verified library in `dir`, if it is there and matches the pin.
 pub fn verified_library(dir: &Path) -> Option<PathBuf> {
     let path = dir.join(RELEASE.file_name);
-    let data = std::fs::read(&path).ok()?;
-    (sha256_hex(&data) == RELEASE.sha256_so).then_some(path)
+    read_checked(&path, RELEASE.sha256_so).map(|_| path)
 }
 
 /// Checks a downloaded `.so.bz2` against the pins and returns the library bytes.
 pub fn verify_and_unpack(bz2: &[u8]) -> Result<Vec<u8>, DownloadError> {
+    unpack_checked(bz2, RELEASE.sha256_bz2, RELEASE.sha256_so, MAX_LIBRARY)
+}
+
+/// [`verify_and_unpack`] with the pins and the size limit as parameters.
+fn unpack_checked(bz2: &[u8], pin_bz2: &'static str, pin_so: &'static str, max_so: u64) -> Result<Vec<u8>, DownloadError> {
     let got = sha256_hex(bz2);
-    if got != RELEASE.sha256_bz2 {
-        return Err(DownloadError::Mismatch(RELEASE.sha256_bz2, got));
+    if got != pin_bz2 {
+        return Err(DownloadError::Mismatch(pin_bz2, got));
     }
-    let mut so = Vec::with_capacity(2 << 20);
-    bzip2_rs::DecoderReader::new(bz2).take(MAX_DOWNLOAD * 4).read_to_end(&mut so).map_err(|e| DownloadError::Decompress(e.to_string()))?;
+    let so = read_limited(bzip2_rs::DecoderReader::new(bz2), max_so).map_err(|e| match e {
+        DownloadError::Io(e) => DownloadError::Decompress(e.to_string()),
+        other => other,
+    })?;
     let got = sha256_hex(&so);
-    if got != RELEASE.sha256_so {
-        return Err(DownloadError::Mismatch(RELEASE.sha256_so, got));
+    if got != pin_so {
+        return Err(DownloadError::Mismatch(pin_so, got));
     }
     Ok(so)
 }
@@ -112,8 +157,7 @@ pub fn fetch(dir: &Path) -> Result<PathBuf, DownloadError> {
         return Ok(p);
     }
     let response = ureq::get(RELEASE.url).call().map_err(|e| DownloadError::Http(e.to_string()))?;
-    let mut bz2 = Vec::with_capacity(1 << 20);
-    response.into_body().into_reader().take(MAX_DOWNLOAD).read_to_end(&mut bz2)?;
+    let bz2 = read_limited(response.into_body().into_reader(), MAX_DOWNLOAD)?;
     let so = verify_and_unpack(&bz2)?;
     install(dir, &so)
 }
@@ -131,6 +175,53 @@ mod tests {
     fn a_tampered_download_is_refused_before_unpacking() {
         let err = verify_and_unpack(b"BZh91AY&SY not cisco").unwrap_err();
         assert!(matches!(err, DownloadError::Mismatch(want, _) if want == RELEASE.sha256_bz2));
+    }
+
+    const TEST_BZ2: &str = "425a6839314159265359797371d700000cd9800010400415002ae7de00200048a9e9a9e498f5061429a3d268d343408861cb1e71bf8801d2f5eaaf3baf7972b69ccda1928168b3959ba1d6c0407c5dc914e14241e5cdc75c";
+    const TEST_BZ2_SHA: &str = "008dfa283580d50775abd0d1225762a454c97202d01b96f35304899bd105ac4b";
+    const TEST_SO_SHA: &str = "a334f5763a3fc54050f0975de9edb7dc511aefdcde81e6139bea5d51946f5211";
+
+    fn test_bz2() -> Vec<u8> {
+        (0..TEST_BZ2.len()).step_by(2).map(|i| u8::from_str_radix(&TEST_BZ2[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn unpacking_checks_both_pins_and_the_size() {
+        let bz2 = test_bz2();
+        let ok = unpack_checked(&bz2, TEST_BZ2_SHA, TEST_SO_SHA, 1 << 20).unwrap();
+        assert_eq!(sha256_hex(&ok), TEST_SO_SHA);
+        // the compressed file's pin
+        let bad = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(matches!(unpack_checked(&bz2, bad, TEST_SO_SHA, 1 << 20), Err(DownloadError::Mismatch(w, _)) if w == bad));
+        // the library's pin (the bytes inside are not the pinned ones)
+        assert!(matches!(unpack_checked(&bz2, TEST_BZ2_SHA, bad, 1 << 20), Err(DownloadError::Mismatch(w, _)) if w == bad));
+        // the size limit: exactly the size passes, one byte less is refused (not silently truncated)
+        assert!(unpack_checked(&bz2, TEST_BZ2_SHA, TEST_SO_SHA, 56).is_ok());
+        assert!(matches!(unpack_checked(&bz2, TEST_BZ2_SHA, TEST_SO_SHA, 55), Err(DownloadError::TooBig)));
+    }
+
+    #[test]
+    fn reads_are_limited_without_truncating() {
+        assert_eq!(read_limited(&b"abcd"[..], 4).unwrap(), b"abcd");
+        assert!(matches!(read_limited(&b"abcde"[..], 4), Err(DownloadError::TooBig)));
+    }
+
+    #[test]
+    fn the_checked_bytes_are_the_bytes_that_get_loaded() {
+        let dir = std::env::temp_dir().join(format!("kalango-cast-openh264-fd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("lib.so");
+        std::fs::write(&p, b"library bytes").unwrap();
+        let pin = sha256_hex(b"library bytes");
+        let bytes = read_checked(&p, &pin).unwrap();
+        // the file is swapped after the check: the in-memory copy still holds what was verified
+        let mem = memfd_copy(&bytes).unwrap();
+        std::fs::write(&p, b"evil").unwrap();
+        let via = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&mem));
+        assert_eq!(std::fs::read(via).unwrap(), b"library bytes");
+        assert!(read_checked(&p, &pin).is_none(), "the swapped file no longer matches");
+        assert!(read_checked(&dir.join("missing"), &pin).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

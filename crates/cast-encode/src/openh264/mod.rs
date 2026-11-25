@@ -88,13 +88,30 @@ struct ISVCEncoderVtbl {
 type CreateEncoder = unsafe extern "C" fn(*mut *mut *const ISVCEncoderVtbl) -> c_int;
 type DestroyEncoder = unsafe extern "C" fn(*mut *const ISVCEncoderVtbl);
 
-/// The verified library path, if it is in the cache.
-pub fn library_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("KALANGO_CAST_OPENH264").map(PathBuf::from) {
-        let data = std::fs::read(&p).ok()?;
-        return (download::sha256_hex(&data) == download::RELEASE.sha256_so).then_some(p);
+/// Where the library should be: `KALANGO_CAST_OPENH264`, or the cache.
+fn candidate_path() -> Option<PathBuf> {
+    match std::env::var_os("KALANGO_CAST_OPENH264") {
+        Some(p) => Some(PathBuf::from(p)),
+        None => Some(download::cache_dir()?.join(download::RELEASE.file_name)),
     }
-    download::verified_library(&download::cache_dir()?)
+}
+
+/// The library path, if what is there matches the pinned checksum (for probing; loading uses [`load_library`], which
+/// does not trust the path again).
+pub fn library_path() -> Option<PathBuf> {
+    let p = candidate_path()?;
+    download::read_checked(&p, download::RELEASE.sha256_so).map(|_| p)
+}
+
+/// Loads the library from the very bytes that were checked: the file is opened and hashed once, the bytes go to an
+/// in-memory file, and that is what `dlopen` gets (no window between verifying and loading).
+fn load_library() -> Result<Library, EncodeError> {
+    let path = candidate_path().ok_or_else(|| EncodeError(tr("OpenH264 is not downloaded").into()))?;
+    let bytes = download::read_checked(&path, download::RELEASE.sha256_so).ok_or_else(|| EncodeError(tr("OpenH264 is not downloaded").into()))?;
+    let mem = download::memfd_copy(&bytes).map_err(|e| EncodeError(e.to_string()))?;
+    let via = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&mem));
+    // SAFETY: the bytes match the pinned SHA-256 of Cisco's release (read_checked), and they are the bytes loaded.
+    unsafe { Library::new(&via) }.map_err(|e| EncodeError(e.to_string()))
 }
 
 pub fn probe() -> Capability {
@@ -132,9 +149,7 @@ impl OpenH264Encoder {
         if s.codec != VideoCodec::H264 {
             return Err(EncodeError(tr("OpenH264 encodes H.264 only").into()));
         }
-        let path = library_path().ok_or_else(|| EncodeError(tr("OpenH264 is not downloaded").into()))?;
-        // SAFETY: a library whose bytes match the pinned SHA-256 of Cisco's release (checked by library_path).
-        let lib = unsafe { Library::new(&path) }.map_err(|e| EncodeError(e.to_string()))?;
+        let lib = load_library()?;
         // SAFETY: the C entry points of codec_api.h, with their exact signatures.
         let (create, destroy): (CreateEncoder, DestroyEncoder) = unsafe {
             (
