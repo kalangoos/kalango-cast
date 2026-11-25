@@ -1,0 +1,31 @@
+[package]
+name = "cast-engine"
+description = "Kalango Cast: o motor de gravação (captura → codificação → MP4), o serviço kalango-castd e a linha de comando kalango-cast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kalango-castd"
+path = "src/bin/kalango-castd.rs"
+
+[[bin]]
+name = "kalango-cast"
+path = "src/bin/kalango-cast.rs"
+
+[dependencies]
+cast-capture.workspace = true
+cast-core.workspace = true
+cast-encode.workspace = true
+cast-mux.workspace = true
+libc.workspace = true
+libloading.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+
+[lints]
+workspace = true

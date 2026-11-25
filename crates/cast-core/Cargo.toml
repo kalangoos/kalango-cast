@@ -1,0 +1,17 @@
+[package]
+name = "cast-core"
+description = "Kalango Cast: o relógio de mídia único, os tipos comuns e as traduções"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

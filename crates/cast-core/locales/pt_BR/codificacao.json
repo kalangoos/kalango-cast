@@ -1,0 +1,14 @@
+{
+  "NVENC needs the GPU's OpenGL context": "O NVENC precisa do contexto OpenGL da GPU",
+  "NVIDIA driver too old for NVENC API": "Driver da NVIDIA antigo demais para a API do NVENC",
+  "No GPU with a VA-API encoder": "Nenhuma GPU com codificador VA-API",
+  "Not downloaded yet: Cisco's binary is fetched on demand": "Ainda não baixado: o binário da Cisco é baixado quando você pedir",
+  "OpenH264 encodes H.264 only": "O OpenH264 só codifica H.264",
+  "OpenH264 is not downloaded": "O OpenH264 não foi baixado",
+  "This frame needs the GPU to be read": "Este quadro precisa da GPU para ser lido",
+  "VA-API encoding is not available yet": "A codificação por VA-API ainda não está disponível",
+  "is not supported by this GPU": "não é suportado por esta GPU",
+  "libva is not installed": "a libva não está instalada",
+  "no VA-API driver for this GPU": "nenhum driver VA-API para esta GPU",
+  "the VA-API driver has no encoder": "o driver VA-API não tem codificador"
+}

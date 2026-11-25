@@ -1,0 +1,116 @@
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 49fbc6b..2d81085 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -164,7 +164,7 @@ impl Backend {
+     {
+         match self {
+             Backend::Tty(tty) => tty.primary_gbm_device(),
+-            Backend::Winit(_) => None,
++            Backend::Winit(winit) => winit.gbm_device(),
+             Backend::Headless(_) => None,
+         }
+     }
+diff --git a/src/backend/winit.rs b/src/backend/winit.rs
+index d658be7..5cb118f 100644
+--- a/src/backend/winit.rs
++++ b/src/backend/winit.rs
+@@ -34,6 +34,10 @@ pub struct Winit {
+     damage_tracker: OutputDamageTracker,
+     dmabuf_global: Option<DmabufGlobal>,
+     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
++    // KalangoOS: screencasting in the nested session (Kalango Cast's tests): a GBM device on the render node of the
++    // EGL display the window renders with, as tty has for its primary GPU.
++    #[cfg(feature = "xdp-gnome-screencast")]
++    gbm: Option<smithay::backend::allocator::gbm::GbmDevice<smithay::backend::drm::DrmDeviceFd>>,
+ }
+ 
+ impl Winit {
+@@ -43,8 +47,16 @@ impl Winit {
+     ) -> Result<Self, winit::Error> {
+         let _span = tracy_client::span!("Winit::new");
+ 
++        // KalangoOS: KALANGO_NIRI_WINIT_SIZE=WxH sets the window's first size (benchmarks at 1080p or a monitor's size).
++        let (w, h) = std::env::var("KALANGO_NIRI_WINIT_SIZE")
++            .ok()
++            .and_then(|s| {
++                let (w, h) = s.split_once('x')?;
++                Some((w.parse::<f64>().ok()?, h.parse::<f64>().ok()?))
++            })
++            .unwrap_or((1280.0, 800.0));
+         let builder = Window::default_attributes()
+-            .with_inner_size(LogicalSize::new(1280.0, 800.0))
++            .with_inner_size(LogicalSize::new(w, h))
+             // .with_resizable(false)
+             .with_title("niri")
+             .with_name("niri", "");
+@@ -145,6 +157,8 @@ impl Winit {
+             damage_tracker,
+             dmabuf_global: None,
+             ipc_outputs,
++            #[cfg(feature = "xdp-gnome-screencast")]
++            gbm: None,
+         })
+     }
+ 
+@@ -176,6 +190,11 @@ impl Winit {
+ 
+         self.create_dmabuf_global(niri);
+ 
++        #[cfg(feature = "xdp-gnome-screencast")]
++        {
++            self.gbm = self.open_gbm_device();
++        }
++
+         niri.add_output(self.output.clone(), None, false);
+     }
+ 
+@@ -212,6 +231,48 @@ impl Winit {
+         assert!(self.dmabuf_global.replace(dmabuf_global).is_none());
+     }
+ 
++    /// KalangoOS: the GBM device of the render node behind the window's EGL display (None without one: llvmpipe).
++    #[cfg(feature = "xdp-gnome-screencast")]
++    fn open_gbm_device(
++        &mut self,
++    ) -> Option<smithay::backend::allocator::gbm::GbmDevice<smithay::backend::drm::DrmDeviceFd>> {
++        use smithay::backend::allocator::gbm::GbmDevice;
++        use smithay::backend::drm::DrmDeviceFd;
++        use smithay::utils::DeviceFd;
++
++        let renderer = self.backend.renderer();
++        let display = renderer.egl_context().display();
++        let node = EGLDevice::device_for_display(display)
++            .ok()?
++            .try_get_render_node()
++            .ok()??;
++        let path = node.dev_path()?;
++        let file = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(&path)
++            .map_err(|err| warn!("screencast: error opening {path:?}: {err}"))
++            .ok()?;
++        let fd = DrmDeviceFd::new(DeviceFd::from(std::os::fd::OwnedFd::from(file)));
++        match GbmDevice::new(fd) {
++            Ok(gbm) => {
++                info!("screencast: GBM device on {path:?}");
++                Some(gbm)
++            }
++            Err(err) => {
++                warn!("screencast: error creating GBM device: {err}");
++                None
++            }
++        }
++    }
++
++    #[cfg(feature = "xdp-gnome-screencast")]
++    pub fn gbm_device(
++        &self,
++    ) -> Option<smithay::backend::allocator::gbm::GbmDevice<smithay::backend::drm::DrmDeviceFd>> {
++        self.gbm.clone()
++    }
++
+     pub fn seat_name(&self) -> String {
+         "winit".to_owned()
+     }

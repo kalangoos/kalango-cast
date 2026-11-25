@@ -1,0 +1,19 @@
+Kalango Cast
+Copyright (C) 2026 The KalangoOS contributors
+Licensed under the GNU General Public License, version 3 or later (LICENSE).
+
+This product includes or is based on the following third-party work:
+
+- crates/cast-encode/src/nvenc/sys.rs: Rust bindings generated from nvEncodeAPI.h (NVIDIA Video Codec SDK API 13.0,
+  as packaged by FFmpeg's nv-codec-headers, tag n13.0.19.0). Copyright (c) 2010-2026 NVIDIA Corporation. MIT
+  licence; the full notice is at the top of that file.
+
+- crates/cast-mux: the crash-safe fragmented MP4 design (moov first; each fragment's index written as `free` and
+  published as `moof` only once its media data is on disk) follows isocast-mux from Isocast
+  (https://github.com/anomalyco/isocast), Copyright (c) 2026 The Isocast contributors, licensed MIT OR Apache-2.0.
+  No Isocast code was copied; the implementation here is new.
+
+- crates/cast-encode/src/openh264: the C interface declarations (struct layouts, constants) follow OpenH264's
+  codec_api.h / codec_app_def.h / codec_def.h, release 2.6.0, Copyright (c) 2013, Cisco Systems, BSD-2-Clause.
+  Cisco's OpenH264 binary is NOT distributed with Kalango Cast: it is downloaded from Cisco on demand
+  ("OpenH264 Video Codec provided by Cisco Systems, Inc.") and checked against a pinned SHA-256.

@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cast-core",
+    "crates/cast-capture",
+    "crates/cast-encode",
+    "crates/cast-mux",
+    "crates/cast-engine",
+    "crates/cast-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/kalangoos/kalango-cast"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+cast-core = { path = "crates/cast-core" }
+cast-capture = { path = "crates/cast-capture" }
+cast-encode = { path = "crates/cast-encode" }
+cast-mux = { path = "crates/cast-mux" }
+cast-engine = { path = "crates/cast-engine" }
+cast-testkit = { path = "crates/cast-testkit" }
+libc = "0.2.191"
+libloading = "0.9.1"
+pipewire = { version = "0.9.2", features = ["v0_3_33"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+zbus = { version = "5.19.0", default-features = false, features = ["blocking-api", "async-io"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+# Video and sound are processed in real time: even the everyday (debug) build is optimised.
+[profile.dev]
+opt-level = 2
+debug = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+debug = 1

@@ -1,0 +1,19 @@
+{
+  "A recording is already running": "Já há uma gravação em andamento",
+  "Desktop": "Som do computador",
+  "Invalid JSON": "JSON inválido",
+  "Microphone": "Microfone",
+  "No encoder available for this codec": "Nenhum codificador disponível para este codec",
+  "No recording is running": "Nenhuma gravação em andamento",
+  "No video frame arrived": "Nenhum quadro de vídeo chegou",
+  "The encoder gave no parameter sets": "O codificador não entregou os conjuntos de parâmetros",
+  "The file already exists": "O arquivo já existe",
+  "The folder {path} does not exist": "A pasta {path} não existe",
+  "The path must be absolute": "O caminho precisa ser absoluto",
+  "The screencast sent no frames": "A captura de tela não enviou quadros",
+  "Unknown method": "Método desconhecido",
+  "encode failed": "falha ao codificar",
+  "kalango-castd is already running": "o kalango-castd já está rodando",
+  "sound not recorded": "som não gravado",
+  "the folder must be yours and closed to others (0700)": "a pasta precisa ser sua e fechada para os outros (0700)"
+}

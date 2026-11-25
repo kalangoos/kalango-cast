@@ -1,0 +1,34 @@
+[package]
+name = "cast-testkit"
+description = "Kalango Cast: ferramentas de teste (sessão niri aninhada, emissor de claquete, análise de sincronia, benchmark)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kalango-cast-clap"
+path = "src/bin/clap.rs"
+
+[[bin]]
+name = "kalango-cast-bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+cast-capture.workspace = true
+cast-core.workspace = true
+libc.workspace = true
+pipewire.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client"] }
+
+[dev-dependencies]
+cast-engine.workspace = true
+cast-mux.workspace = true
+
+[lints]
+workspace = true

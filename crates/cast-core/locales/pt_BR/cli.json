@@ -1,0 +1,17 @@
+{
+  "DBUS_ADDRESS": "ENDEREÇO_DBUS",
+  "Done: {path} · {dur} s · {frames} frames · {dropped} dropped · {mb} MB · {frags} fragments · encode {enc} ms (max {encmax}) · latency {lat} ms (max {latmax}) · CPU {cpu} % · RSS {rss} MB": "Pronto: {path} · {dur} s · {frames} quadros · {dropped} perdidos · {mb} MB · {frags} fragmentos · codificação {enc} ms (máx. {encmax}) · latência {lat} ms (máx. {latmax}) · CPU {cpu} % · RSS {rss} MB",
+  "Downloading OpenH264 from Cisco (openh264.org); Cisco licenses the H.264 patents for its binary.": "Baixando o OpenH264 da Cisco (openh264.org); a Cisco licencia as patentes do H.264 para o binário dela.",
+  "No monitor to record": "Nenhum monitor para gravar",
+  "PATH": "CAMINHO",
+  "Recording {w}×{h} with {encoder} ({device}{zc}) to {path}": "Gravando {w}×{h} com {encoder} ({device}{zc}) em {path}",
+  "Verified and installed": "Conferido e instalado",
+  "XDG_RUNTIME_DIR is not set: pass --socket": "XDG_RUNTIME_DIR não está definido: use --socket",
+  "fragments": "fragmentos",
+  "listening on": "escutando em",
+  "stopping": "parando",
+  "unknown option": "opção desconhecida",
+  "usage: kalango-cast record|sources|caps|inspect|openh264|rpc …  (see the source's header or the README)": "uso: kalango-cast record|sources|caps|inspect|openh264|rpc …  (veja o cabeçalho do código ou o README)",
+  "zero-copy": "zero-cópia",
+  "{t} s · {fps} fps · {frames} frames · {dropped} dropped · encode {enc} ms · latency {lat} ms · {kbps} kbit/s · CPU {cpu} %": "{t} s · {fps} qps · {frames} quadros · {dropped} perdidos · codificação {enc} ms · latência {lat} ms · {kbps} kbit/s · CPU {cpu} %"
+}

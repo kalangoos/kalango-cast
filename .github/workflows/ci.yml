@@ -1,0 +1,124 @@
+name: CI
+
+# The quality gate of every pull request and of every push to main: formatting, clippy (warnings are errors), the
+# tests that run on a GitHub runner, and cargo-deny (licences, sources, advisories). The "CI" job at the end is the
+# one check branch protection waits for. It follows the KalangoOS workflows (pinned actions, hardened runner).
+#
+# Not here, on purpose: the end-to-end test against a real niri (crates/cast-testkit/tests/niri_session.rs) needs a
+# GPU, a display and a niri that screencasts in a window (tests/niri/); it says it was skipped on the runner and runs
+# on a developer machine. Likewise the NVENC/VA-API paths: their probes report "unavailable" on the runner.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  LANG: C.UTF-8
+  RUST_TOOLCHAIN: "1.98.0"
+  CARGO_DENY_VERSION: "0.22.0"
+  CARGO_DENY_SHA256: "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786"
+
+jobs:
+  lint:
+    name: Formatação e clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Bibliotecas do sistema e Rust
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update -q
+          # PipeWire's headers and libclang for pipewire-sys's bindgen
+          sudo apt-get -o Acquire::Retries=3 install -y -q --no-install-recommends libpipewire-0.3-dev libclang-dev pkg-config
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: lint
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  testes:
+    name: Testes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Bibliotecas do sistema e Rust
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update -q
+          # ffmpeg: the MP4 tests read the files back with ffprobe; libopus0: the Opus encoder test
+          sudo apt-get -o Acquire::Retries=3 install -y -q --no-install-recommends libpipewire-0.3-dev libclang-dev pkg-config ffmpeg libopus0
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: testes
+      - name: Testes do workspace
+        run: cargo test --workspace --locked --no-fail-fast
+
+  deny:
+    name: Licenças, fontes e alertas (cargo-deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo-deny
+        run: |
+          set -euo pipefail
+          name="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          cd "$RUNNER_TEMP"
+          curl -sSfL --retry 3 -o deny.tar.gz \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  deny.tar.gz" | sha256sum -c -
+          tar xzf deny.tar.gz
+          cd "$GITHUB_WORKSPACE"
+          "$RUNNER_TEMP/${name}/cargo-deny" --locked check licenses bans sources advisories
+
+  ci:
+    name: CI
+    if: always()
+    needs: [lint, testes, deny]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Todos os jobs passaram
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "resultados: $RESULTS"
+          for r in $RESULTS; do [ "$r" = success ] || exit 1; done
