@@ -231,7 +231,7 @@ mod tests {
         }
         // 20 s of 0.1 % drift is 20 ms: corrected, and the track ends within the tolerance of the clock
         assert!(skipped > 0);
-        let end_true = (2000 * 10_000_000 - 2000 * 10_000) as i64;
+        let end_true: i64 = 2000 * 10_000_000 - 2000 * 10_000;
         let end_track = t.next_ns().unwrap();
         assert!((end_track - end_true).abs() <= 10_000_000, "{end_track} vs {end_true}");
     }

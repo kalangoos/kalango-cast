@@ -52,11 +52,9 @@ fn record_for(o: RecordOptions, seconds: f64) -> (cast_mux::Summary, cast_engine
 }
 
 #[test]
+#[ignore = "needs a niri that screencasts in a window and a display: set KALANGO_CAST_NIRI and pass --ignored"]
 fn niri_session_end_to_end() {
-    let Some(niri) = cast_testkit::niri_binary() else {
-        eprintln!("skipped: KALANGO_CAST_NIRI is not set (needs a niri that screencasts in a window and a display)");
-        return;
-    };
+    let niri = cast_testkit::niri_binary().expect("KALANGO_CAST_NIRI points at the patched niri (tests/niri/README.md)");
     assert!(have("ffprobe") && have("ffmpeg"), "ffmpeg/ffprobe are needed to check the files");
     let d = dir();
     let session = NestedNiri::start(&niri, &d.join("session"), 1280, 800).expect("nested niri");

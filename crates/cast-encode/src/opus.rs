@@ -103,10 +103,7 @@ mod tests {
 
     #[test]
     fn encodes_a_tone_into_small_packets() {
-        let Ok(mut enc) = OpusEncoder::new(2, 128_000) else {
-            eprintln!("skipped: no libopus");
-            return;
-        };
+        let mut enc = OpusEncoder::new(2, 128_000).expect("libopus is installed (libopus0)");
         assert!(enc.pre_skip > 0 && enc.pre_skip < 1000, "lookahead {}", enc.pre_skip);
         let mut out = Vec::new();
         let mut total = 0;

@@ -174,9 +174,13 @@ mod tests {
 
     #[test]
     fn process_usage_is_readable() {
+        // the kernel counts CPU in clock ticks (10 ms): spin until at least one has been charged
+        let start = std::time::Instant::now();
         let mut x = 0u64;
-        for i in 0..2_000_000u64 {
-            x = x.wrapping_mul(31).wrapping_add(i);
+        while cpu_time_ns() == 0 && start.elapsed() < std::time::Duration::from_secs(5) {
+            for i in 0..1_000_000u64 {
+                x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(i));
+            }
         }
         assert!(x != 1);
         assert!(cpu_time_ns() > 0);

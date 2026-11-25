@@ -143,11 +143,9 @@ mod tests {
 
     /// The real download (network): set KALANGO_CAST_OPENH264_NET=1 to run it.
     #[test]
+    #[ignore = "needs the network: set KALANGO_CAST_OPENH264_NET=1 and pass --ignored"]
     fn downloads_and_verifies_ciscos_binary() {
-        if std::env::var_os("KALANGO_CAST_OPENH264_NET").is_none() {
-            eprintln!("skipped: KALANGO_CAST_OPENH264_NET not set");
-            return;
-        }
+        assert!(std::env::var_os("KALANGO_CAST_OPENH264_NET").is_some(), "set KALANGO_CAST_OPENH264_NET=1");
         let dir = std::env::temp_dir().join(format!("kalango-cast-openh264-net-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let p = fetch(&dir).unwrap();
