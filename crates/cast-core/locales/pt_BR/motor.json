@@ -25,5 +25,6 @@
   "Recording requested: {what}. To allow it, run: kalango-cast approve {token}": "Gravação pedida: {what}. Para permitir, rode: kalango-cast approve {token}",
   "RECORDING STARTED: {path}": "GRAVAÇÃO INICIADA: {path}",
   "recording stopped: {path}": "gravação encerrada: {path}",
-  "RECORDING FAILED: {path}: {error}": "A GRAVAÇÃO FALHOU: {path}: {error}"
+  "RECORDING FAILED: {path}: {error}": "A GRAVAÇÃO FALHOU: {path}: {error}",
+  "control or invisible characters are not allowed": "caracteres de controle ou invisíveis não são permitidos"
 }

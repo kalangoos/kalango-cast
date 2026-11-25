@@ -216,11 +216,30 @@ fn audio_choice(v: Option<&Value>) -> Option<AudioChoice> {
     }
 }
 
+/// A character that could fake or hide text on the trusted channel (the terminal where the person approves):
+/// controls (C0, DEL, C1), line/paragraph separators, zero-width and bidirectional formatting characters.
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{200B}'..='\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// Rejects a client-supplied string that holds such characters.
+fn plain(what: &str, s: &str) -> Result<(), RpcError> {
+    if s.chars().any(is_unsafe_char) {
+        return Err((-32602, format!("{what}: {}", tr("control or invisible characters are not allowed"))));
+    }
+    Ok(())
+}
+
 /// Validates `record.start`'s parameters into options.
 pub fn parse_start(params: &Value) -> Result<RecordOptions, RpcError> {
     let bad = |m: String| (-32602, m);
     let source: Source = serde_json::from_value(params.get("source").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("source: {e}")))?;
-    let path = PathBuf::from(params.get("path").and_then(|p| p.as_str()).ok_or_else(|| bad("path".into()))?);
+    let path_text = params.get("path").and_then(|p| p.as_str()).ok_or_else(|| bad("path".into()))?;
+    plain("path", path_text)?;
+    if let Source::Monitor { connector } | Source::Area { connector, .. } = &source {
+        plain("source", connector)?;
+    }
+    let path = PathBuf::from(path_text);
     if !path.is_absolute() {
         return Err(bad(tr("The path must be absolute").into()));
     }
@@ -246,6 +265,11 @@ pub fn parse_start(params: &Value) -> Result<RecordOptions, RpcError> {
     }
     o.desktop_audio = Some(audio_choice(params.get("desktop_audio")).ok_or_else(|| bad("desktop_audio".into()))?);
     o.mic = Some(audio_choice(params.get("mic")).ok_or_else(|| bad("mic".into()))?);
+    for (what, c) in [("desktop_audio", &o.desktop_audio), ("mic", &o.mic)] {
+        if let Some(AudioChoice::Named(n)) = c {
+            plain(what, n)?;
+        }
+    }
     Ok(o)
 }
 
@@ -256,9 +280,40 @@ fn new_token() -> Result<String, RpcError> {
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
+/// What an approval is for: every field of the parsed request, so a different request needs its own approval.
+fn fingerprint(o: &RecordOptions) -> String {
+    format!("{o:?}")
+}
+
+fn audio_text(c: &Option<AudioChoice>) -> String {
+    match c {
+        None | Some(AudioChoice::Off) => "off".into(),
+        Some(AudioChoice::Default) => "default device".into(),
+        Some(AudioChoice::Named(n)) => format!("{n:?}"),
+    }
+}
+
+/// What the person is asked to approve, built from the parsed request (what is shown is what runs). Everything the
+/// client chose is printed escaped (`{:?}`) and the path comes last, on its own line.
 fn describe(o: &RecordOptions) -> String {
-    let on = |c: &Option<AudioChoice>| c.as_ref().is_some_and(|c| *c != AudioChoice::Off);
-    format!("{:?} -> {} (desktop sound: {}, microphone: {})", o.source, o.path.display(), on(&o.desktop_audio), on(&o.mic))
+    let exists = std::fs::symlink_metadata(&o.path).is_ok();
+    let mode = match (o.overwrite, exists) {
+        (true, true) => "REPLACES an existing recording",
+        (true, false) => "new file (overwrite allowed, nothing there now)",
+        (false, true) => "refused: the file already exists",
+        (false, false) => "new file",
+    };
+    format!(
+        "source: {:?}\ndesktop sound: {}\nmicrophone: {}\nvideo: {:?}, {} fps, bitrate {}\nmode: {mode}\nfolder: {:?}\nfile: {:?}",
+        o.source,
+        audio_text(&o.desktop_audio),
+        audio_text(&o.mic),
+        o.codec,
+        o.fps,
+        if o.bitrate_kbps == 0 { "automatic".to_string() } else { format!("{} kbit/s", o.bitrate_kbps) },
+        o.path.parent().unwrap_or(Path::new("/")),
+        o.path.file_name().unwrap_or_default(),
+    )
 }
 
 impl Daemon {
@@ -355,7 +410,7 @@ impl Daemon {
                     // a recording that failed (a full disk) is over: make room for a new one
                     let _ = r.stop();
                 }
-                self.check_consent(params.to_string(), describe(&o))?;
+                self.check_consent(fingerprint(&o), describe(&o))?;
                 let path = o.path.display().to_string();
                 let r = Recorder::start(o).map_err(app)?;
                 let status = r.status();
@@ -558,6 +613,97 @@ mod tests {
             ["a.mp4", "Videos/a.mp4", "./a.mp4", "/home/me/../../etc/a.mp4", "/home/me/.bashrc", "/home/me/a.mp4.sh", "/home/me/mp4", "/home/me/a"]
         {
             assert_eq!(with(bad).unwrap_err().0, -32602, "{bad}");
+        }
+    }
+
+    fn opts(extra: Value) -> RecordOptions {
+        let mut v = start_params(Path::new("/home/me/Videos/a.mp4"));
+        for (k, val) in extra.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        parse_start(&v).unwrap()
+    }
+
+    #[test]
+    fn text_that_could_fake_the_consent_line_is_refused() {
+        for evil in [
+            "/tmp/\u{1b}[2K\rapproved.mp4",
+            "/tmp/a\rb.mp4",
+            "/tmp/a\nb.mp4",
+            "/tmp/a\u{202e}4pm.mp4",
+            "/tmp/a\u{9b}2K.mp4",
+            "/tmp/a\u{200b}.mp4",
+            "/tmp/a\u{7f}.mp4",
+            "/tmp/a\u{2028}.mp4",
+            "/tmp/a\0.mp4",
+        ] {
+            assert_eq!(parse_start(&json!({"source": {"kind": "window", "id": 3}, "path": evil})).unwrap_err().0, -32602, "{evil:?}");
+        }
+        let src = |c: &str| parse_start(&json!({"source": {"kind": "monitor", "connector": c}, "path": "/tmp/a.mp4"}));
+        assert!(src("DP-1").is_ok());
+        assert_eq!(src("DP-1\u{1b}[2K").unwrap_err().0, -32602);
+        let named = |m: &str| parse_start(&json!({"source": {"kind": "window", "id": 3}, "path": "/tmp/a.mp4", "mic": m}));
+        assert!(named("usb mic").is_ok());
+        assert_eq!(named("x\u{202e}y").unwrap_err().0, -32602);
+    }
+
+    #[test]
+    fn the_description_escapes_what_the_client_chose_and_puts_the_path_last() {
+        // even if a hostile value got past parsing, nothing raw reaches the terminal
+        let mut o = opts(json!({}));
+        o.path = PathBuf::from("/tmp/\u{1b}[2K\rAPPROVED\n\u{202e}.mp4");
+        o.source = Source::Monitor { connector: "DP-1\u{1b}[31m".into() };
+        o.mic = Some(AudioChoice::Named("m\u{9b}".into()));
+        let text = describe(&o);
+        assert!(!text.chars().any(|c| is_unsafe_char(c) && c != '\n'), "{text:?}");
+        assert_eq!(text.lines().count(), 7, "one line per fact, the client's text cannot add lines: {text:?}");
+        assert!(text.lines().last().unwrap().starts_with("file: "));
+        assert!(text.lines().next().unwrap().starts_with("source: "));
+    }
+
+    #[test]
+    fn the_description_says_whether_it_replaces_a_recording() {
+        let dir = scratch("describe");
+        let existing = dir.join("old.mp4");
+        std::fs::write(&existing, b"").unwrap();
+        let on = |path: &Path, over: bool| {
+            let mut v = start_params(path);
+            v["overwrite"] = json!(over);
+            describe(&parse_start(&v).unwrap())
+        };
+        assert!(on(&existing, true).contains("mode: REPLACES an existing recording"));
+        assert!(on(&existing, false).contains("already exists"));
+        assert!(on(&dir.join("new.mp4"), false).contains("mode: new file"));
+        assert!(!on(&dir.join("new.mp4"), false).contains("REPLACES"));
+        let t = describe(&opts(json!({"fps": 30, "bitrate_kbps": 8000, "codec": "hevc", "mic": false})));
+        for part in
+            ["30 fps", "8000 kbit/s", "Hevc", "microphone: off", "desktop sound: default device", "folder: \"/home/me/Videos\"", "file: \"a.mp4\""]
+        {
+            assert!(t.contains(part), "{part} in {t}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changing_any_field_changes_what_is_approved() {
+        let base = fingerprint(&opts(json!({})));
+        assert_eq!(base, fingerprint(&opts(json!({}))), "the same request, the same fingerprint");
+        assert_eq!(base, fingerprint(&opts(json!({"fps": 60}))), "an explicit default is the same request");
+        for (name, extra) in [
+            ("overwrite", json!({"overwrite": true})),
+            ("fps", json!({"fps": 30})),
+            ("bitrate", json!({"bitrate_kbps": 1000})),
+            ("codec", json!({"codec": "hevc"})),
+            ("encoder", json!({"encoder": "openh264"})),
+            ("mic", json!({"mic": false})),
+            ("mic device", json!({"mic": "usb"})),
+            ("desktop", json!({"desktop_audio": false})),
+            ("desktop device", json!({"desktop_audio": "hdmi"})),
+            ("path", json!({"path": "/home/me/Videos/b.mp4"})),
+            ("folder", json!({"path": "/home/me/Other/a.mp4"})),
+            ("source", json!({"source": {"kind": "window", "id": 9}})),
+        ] {
+            assert_ne!(base, fingerprint(&opts(extra)), "{name} must change the fingerprint");
         }
     }
 
