@@ -5,8 +5,10 @@ name: CI
 # one check branch protection waits for. It follows the KalangoOS workflows (pinned actions, hardened runner).
 #
 # Not here, on purpose: the end-to-end test against a real niri (crates/cast-testkit/tests/niri_session.rs) needs a
-# GPU, a display and a niri that screencasts in a window (tests/niri/); it says it was skipped on the runner and runs
-# on a developer machine. Likewise the NVENC/VA-API paths: their probes report "unavailable" on the runner.
+# GPU, a display and a niri that screencasts in a window (tests/niri/); it is #[ignore]d (runs only with --ignored and
+# KALANGO_CAST_NIRI set) and is run on a developer machine. Likewise the NVENC test (#[ignore], KALANGO_CAST_GPU=1) and
+# the OpenH264 download test (#[ignore], KALANGO_CAST_OPENH264_NET=1); the NVENC/VA-API probes report "unavailable"
+# on the runner.
 on:
   push:
     branches: [main]

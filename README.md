@@ -19,9 +19,9 @@ O código compila e passa no `clippy -D warnings` e nos testes de unidade. Pouco
 |---|---|
 | `cargo check`, `clippy --all-targets -D warnings`, `fmt` | passam |
 | Testes de unidade (relógio, tipos, MP4, conversão, OpenH264 sem rede, serviço) | passam, no disco local |
-| NVENC H.264 e HEVC numa RTX 3090, sem tela (teste `#[ignore]`, `KALANGO_CAST_GPU=1`) | **rodou**, com quadros sintéticos de memória compartilhada (não DMA-BUF): 1080p, ~130–150 quadros/s no total, `encode()` p50 5–6 ms; as saídas foram conferidas só por estrutura (quadros não vazios, IDR, IDR forçado), **não decodificadas** |
+| NVENC H.264 e HEVC numa RTX 3090, sem tela (teste `#[ignore]`, `KALANGO_CAST_GPU=1`) | **rodou**, com quadros sintéticos de memória compartilhada (não DMA-BUF): 1080p, ~130–150 quadros/s no total (esse total **inclui o tempo de CPU que o teste gasta preenchendo os quadros sintéticos**, e o envio de cada quadro da CPU para a GPU; não é o desempenho de uma gravação real), `encode()` p50 5–6 ms; as saídas foram conferidas só por estrutura (quadros não vazios, IDR, IDR forçado), **não decodificadas** |
 | Captura do niri (ScreenCast, DMA-BUF), PipeWire, som, MP4 gravado de ponta a ponta | **nunca executado** (precisa do niri com o patch de `tests/niri/` e de uma tela) |
-| Sincronia de áudio e vídeo, latência de ponta a ponta, uso de CPU/GPU em gravação real | **nunca medidos**; `docs/DESEMPENHO.md` descreve o método, não resultados |
+| Sincronia de áudio e vídeo, latência de ponta a ponta, uso de CPU/GPU em gravação real | **nunca medidos**; [`docs/DESEMPENHO.md`](docs/DESEMPENHO.md) descreve o método e traz só o que foi medido |
 | VA-API (AMD, Intel), OpenH264 | só a detecção do VA-API existe; o OpenH264 não foi rodado (o download conferido tem teste `#[ignore]`, `KALANGO_CAST_OPENH264_NET=1`) |
 
 Testes que dependem de máquina, rede ou compositor são `#[ignore]` e dizem a variável de ambiente que os liga:
@@ -43,7 +43,28 @@ A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, 
 - **MP4 fragmentado e seguro contra quedas**: um fragmento a cada ~2 s; se o computador desligar no meio, o arquivo
   toca até o último fragmento completo.
 - **Serviço `kalango-castd`**: JSON-RPC num socket Unix privado (`$XDG_RUNTIME_DIR/kalango/cast.sock`, 0600, e só
-  aceita processos da mesma pessoa), para o shell, o Kalango Audio e o `kalangod` (agentes, com aprovação).
+  aceita processos da mesma pessoa), para o shell, o Kalango Audio e o `kalangod`. **Ser da mesma pessoa não é consentimento**: por padrão
+  (`consent = "ask"`), `record.start` responde `consent_required` até que a pessoa aprove, no terminal onde o
+  `kalango-castd` roda, com `kalango-cast approve CÓDIGO` (veja "Privacidade e consentimento").
+
+## Privacidade e consentimento
+
+- **Como a captura acontece**: pela API `org.gnome.Mutter.ScreenCast` do niri (D-Bus da sessão) e pelo PipeWire (som
+  do computador e microfone). O Kalango Cast não usa o portal do xdg-desktop-portal.
+- **Consentimento (feito)**: `consent = "ask"` (padrão) ou `"allow"` em `$XDG_CONFIG_HOME/kalango/cast.toml`. Com `ask`,
+  um cliente do socket não começa a gravar sozinho: recebe `consent_required` (erro -32001); o código de uso único
+  (válido 120 s, cancelado após 5 erros, só para aquele pedido) aparece **apenas** no terminal do `kalango-castd`
+  (o `Hook` do daemon), e a pessoa roda `kalango-cast approve CÓDIGO`; o mesmo `record.start` passa uma vez. O
+  `kalango-cast record` na linha de comando é a própria pessoa pedindo e não passa por isso.
+- **Indicador (parcial)**: o daemon avisa início, fim e falha da gravação ao `Hook` (impresso no terminal do
+  `kalango-castd`); **não há indicador na tela nem sinal D-Bus ainda**.
+- **Arquivo de saída**: criado com `O_EXCL|O_NOFOLLOW` (modo 0600) numa pasta que seja sua e não seja um link; só
+  termina em `.mp4`, sem `..`; `overwrite` só troca uma gravação nossa anterior (arquivo comum seu, com um só nome,
+  vazio ou começando com `ftyp`) — nunca `.bashrc` nem o destino de um link.
+- **O que NÃO está feito**: nada impede um programa **hostil da mesma pessoa** que leia o terminal ou a memória do
+  daemon (ou edite o `cast.toml` para `allow`); não há diálogo do compositor por janela, nem registro de auditoria,
+  nem limite de tempo ocioso nas conexões, nem aviso de que o microfone está aberto fora do daemon; as pastas
+  *acima* da pasta de saída podem ser links; o conteúdo gravado não é cifrado.
 
 ## Usar
 
@@ -51,12 +72,13 @@ A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, 
 cargo build --release
 target/release/kalango-cast sources                         # monitores e janelas
 target/release/kalango-cast record --seconds 30 --out gravacao.mp4
-target/release/kalango-cast record --window 12 --no-mic --out janela.mp4
+target/release/kalango-cast record --window 12 --no-mic --out janela.mp4   # --overwrite troca uma gravação anterior
 target/release/kalango-cast record --area DP-1:100,100,1280x720 --codec hevc --out area.mp4
 target/release/kalango-cast caps                            # codificadores desta máquina
 
 target/release/kalango-castd &                              # o serviço
-target/release/kalango-cast rpc record.start '{"source":{"kind":"monitor","connector":"DP-1"},"path":"/tmp/a.mp4"}'
+target/release/kalango-cast rpc record.start '{"source":{"kind":"monitor","connector":"DP-1"},"path":"/tmp/a.mp4"}'   # consent_required: o código aparece no terminal do kalango-castd
+target/release/kalango-cast approve CÓDIGO                  # a pessoa aprova; repita o record.start
 target/release/kalango-cast rpc record.status
 target/release/kalango-cast rpc record.stop
 ```
