@@ -58,7 +58,8 @@ A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, 
   `kalango-cast record` na linha de comando é a própria pessoa pedindo e não passa por isso.
 - **Indicador (parcial)**: o daemon avisa início, fim e falha da gravação ao `Hook` (impresso no terminal do
   `kalango-castd`); **não há indicador na tela nem sinal D-Bus ainda**.
-- **Arquivo de saída**: criado com `O_EXCL|O_NOFOLLOW` (modo 0600) numa pasta que seja sua e não seja um link; só
+- **Arquivo de saída** (a pasta precisa ser **sua**: `/tmp`, que é do root, é recusado, com o motivo na resposta;
+  use por exemplo `~/Videos`): criado com `O_EXCL|O_NOFOLLOW` (modo 0600) numa pasta que seja sua e não seja um link; só
   termina em `.mp4`, sem `..`; `overwrite` só troca uma gravação nossa anterior (arquivo comum seu, com um só nome,
   vazio ou começando com `ftyp`) — nunca `.bashrc` nem o destino de um link.
 - **O que NÃO está feito**: nada impede um programa **hostil da mesma pessoa** que leia o terminal ou a memória do
@@ -77,7 +78,7 @@ target/release/kalango-cast record --area DP-1:100,100,1280x720 --codec hevc --o
 target/release/kalango-cast caps                            # codificadores desta máquina
 
 target/release/kalango-castd &                              # o serviço
-target/release/kalango-cast rpc record.start '{"source":{"kind":"monitor","connector":"DP-1"},"path":"/tmp/a.mp4"}'   # consent_required: o código aparece no terminal do kalango-castd
+target/release/kalango-cast rpc record.start '{"source":{"kind":"monitor","connector":"DP-1"},"path":"'"$HOME"'/Videos/a.mp4"}'   # consent_required: o código aparece no terminal do kalango-castd
 target/release/kalango-cast approve CÓDIGO                  # a pessoa aprova; repita o record.start
 target/release/kalango-cast rpc record.status
 target/release/kalango-cast rpc record.stop

@@ -143,11 +143,13 @@ pub type Hook = Box<dyn Fn(&Event) + Send + Sync>;
 pub struct Limits {
     pub line: usize,
     pub connections: usize,
+    /// How long an approval request, and an approval, stay valid.
+    pub ttl: Duration,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { line: MAX_LINE, connections: MAX_CONNECTIONS }
+        Limits { line: MAX_LINE, connections: MAX_CONNECTIONS, ttl: CONSENT_TTL }
     }
 }
 
@@ -342,7 +344,7 @@ impl Daemon {
         }
         let mut slot = self.pending.lock().map_err(|_| (-32000, "lock".to_string()))?;
         if let Some(p) = slot.as_ref() {
-            if p.created.elapsed() > CONSENT_TTL {
+            if p.created.elapsed() > self.limits.ttl {
                 *slot = None;
             }
         }
@@ -367,7 +369,7 @@ impl Daemon {
         let invalid = || (-32002, tr("Invalid or expired approval code").to_string());
         let mut slot = self.pending.lock().map_err(|_| (-32000, "lock".to_string()))?;
         let p = slot.as_mut().ok_or_else(invalid)?;
-        if p.created.elapsed() > CONSENT_TTL {
+        if p.created.elapsed() > self.limits.ttl {
             *slot = None;
             return Err(invalid());
         }
@@ -772,6 +774,46 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_code_cannot_approve_and_an_expired_approval_is_not_used() {
+        let dir = scratch("ttl");
+        let params = start_params(&dir.join("a.mp4"));
+        let limits = Limits { ttl: Duration::from_millis(150), ..Limits::default() };
+        // the code expires before it is used
+        let (d, log) = daemon(Consent::Ask);
+        let d = d.with_limits(limits);
+        assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED);
+        let token = token_of(&log);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(approve(&d, &token)["error"]["code"], -32002, "the right code, too late");
+        // the approval expires before the request is repeated: held again, with a new code
+        let (d, log) = daemon(Consent::Ask);
+        let d = d.with_limits(limits);
+        assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED);
+        let token = token_of(&log);
+        assert_eq!(approve(&d, &token)["result"]["approved"], true);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED);
+        assert_eq!(log.lock().unwrap().len(), 2, "a second request went to the person");
+        assert_ne!(token_of(&log), token);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_folder_says_why_in_the_response() {
+        // the folder of the output must be the user's own (unless the tests run as root)
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (d, _) = daemon(Consent::Allow);
+        let r = start(&d, &start_params(Path::new("/usr/kalango-cast-test.mp4")));
+        assert_eq!(r["error"]["code"], -32000, "{r}");
+        let msg = r["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("/usr") && msg.contains("not yours"), "{msg}");
+        assert!(!Path::new("/usr/kalango-cast-test.mp4").exists());
+    }
+
+    #[test]
     fn with_consent_allowed_no_approval_is_asked() {
         let dir = scratch("allow");
         let (d, log) = daemon(Consent::Allow);
@@ -857,7 +899,7 @@ mod tests {
 
     #[test]
     fn a_line_over_the_limit_is_refused_and_the_connection_closed() {
-        let (dir, sock) = serve_with(Limits { line: 64, connections: 4 }, "line");
+        let (dir, sock) = serve_with(Limits { line: 64, connections: 4, ..Limits::default() }, "line");
         // exactly at the limit is served (the content, without the newline)
         let ok = format!("{{\"id\":1,\"method\":\"record.status\"{}}}", " ".repeat(64 - 33));
         assert_eq!(ok.len(), 64);
@@ -880,7 +922,7 @@ mod tests {
 
     #[test]
     fn connections_are_capped_and_freed() {
-        let (dir, sock) = serve_with(Limits { line: MAX_LINE, connections: 2 }, "conns");
+        let (dir, sock) = serve_with(Limits { connections: 2, ..Limits::default() }, "conns");
         let ping = |c: &mut UnixStream| {
             writeln!(c, r#"{{"id":1,"method":"record.status"}}"#).unwrap();
             read_reply(c)

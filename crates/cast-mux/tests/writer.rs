@@ -127,6 +127,15 @@ fn a_symlink_at_the_path_is_never_followed() {
         assert!(open_output(&link, overwrite).is_err(), "{name}");
         assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
     }
+    // nor a link to a recording of ours (it would pass the content check if it were followed)
+    let own = dir.join("own.mp4");
+    let own_bytes = b"\0\0\0\x18ftypisom\0\0\0\0isomiso2".to_vec();
+    std::fs::write(&own, &own_bytes).unwrap();
+    let to_own = dir.join("to-own.mp4");
+    symlink(&own, &to_own).unwrap();
+    assert!(open_output(&to_own, true).is_err());
+    assert!(open_output(&to_own, false).is_err());
+    assert_eq!(std::fs::read(&own).unwrap(), own_bytes, "our own recording is untouched");
     // a dangling link is not created through either
     let dangling = dir.join("dangling.mp4");
     symlink(dir.join("nowhere"), &dangling).unwrap();
@@ -153,4 +162,12 @@ fn the_folder_must_be_a_real_folder_of_ours() {
         assert_eq!(open_output(Path::new("/kalango-cast-test.mp4"), false).unwrap_err().kind(), ErrorKind::PermissionDenied);
     }
     assert!(open_output(Path::new("relative.mp4"), false).is_err());
+    // a folder of someone else (root's /usr) is refused with the reason, and nothing is created there
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        let e = open_output(Path::new("/usr/kalango-cast-test.mp4"), false).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("not yours"), "{e}");
+        assert!(!Path::new("/usr/kalango-cast-test.mp4").exists());
+    }
 }

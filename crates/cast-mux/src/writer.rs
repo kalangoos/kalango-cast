@@ -122,14 +122,23 @@ pub fn open_output(path: &Path, overwrite: bool) -> io::Result<File> {
     // SAFETY: cparent is a NUL-terminated path; the returned fd (if any) is owned below.
     let raw = unsafe { libc::open(cparent.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
     if raw < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        let why = match e.raw_os_error() {
+            Some(libc::ELOOP) => "the folder is a symbolic link (use the real folder)".to_string(),
+            Some(libc::ENOTDIR) => "the folder is not a folder".to_string(),
+            _ => format!("the folder cannot be opened: {e}"),
+        };
+        return Err(io::Error::new(e.kind(), why));
     }
     // SAFETY: raw is a fresh, valid fd that nothing else owns.
     let dir = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
     // SAFETY: geteuid has no preconditions.
     let me = unsafe { libc::geteuid() };
     if dir.metadata()?.uid() != me {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the folder is not yours"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the folder {} is not yours: record into a folder you own (for example ~/Videos)", parent.display()),
+        ));
     }
     let openat = |flags: libc::c_int| -> io::Result<File> {
         // SAFETY: dir is an open directory fd, cname a NUL-terminated name; the fd returned is owned right away.

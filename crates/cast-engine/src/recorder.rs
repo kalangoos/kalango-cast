@@ -700,10 +700,12 @@ mod tests {
     #[test]
     fn a_full_queue_drops_instead_of_blocking_the_capture_callback() {
         let (tx, rx) = mpsc::sync_channel::<MuxMsg>(2);
-        let t = Instant::now();
-        let accepted = (0..100).filter(|i| offer(&tx, video(*i, false))).count();
-        assert_eq!(accepted, 2, "only the queue's capacity is taken");
-        assert!(t.elapsed() < Duration::from_millis(500), "it never waited");
+        let tx2 = tx.clone();
+        // on its own thread: an offer that blocked would hang here, and the test says so instead
+        let h = std::thread::spawn(move || (0..100).filter(|i| offer(&tx2, video(*i, false))).count());
+        let accepted = wait_for("the offers to return without waiting", || h.is_finished().then(|| h.is_finished()));
+        assert!(accepted);
+        assert_eq!(h.join().unwrap(), 2, "only the queue's capacity is taken");
         drop(rx);
         assert!(!offer(&tx, video(0, true)), "a writer that is gone is a drop too");
     }
