@@ -71,6 +71,10 @@ pub enum Placement {
     Skip(u64),
 }
 
+/// The most silence one buffer may be preceded by: a bogus timestamp (a jump of hours) must not become hours of
+/// silence in the file; a real gap that long is rare, and the next buffers keep filling it in steps.
+pub const MAX_SILENCE_NS: u64 = 10_000_000_000;
+
 /// Places an audio stream's buffers on the media clock by counting samples, correcting drift and gaps past
 /// `tolerance_ns`.
 #[derive(Clone, Debug)]
@@ -129,7 +133,7 @@ impl AudioTimeline {
         let expected = start + self.samples_to_ns(self.samples) as i64;
         let diff = first_ns - expected;
         if diff > self.tolerance_ns as i64 {
-            let gap = self.ns_to_samples(diff as u64);
+            let gap = self.ns_to_samples((diff as u64).min(MAX_SILENCE_NS));
             self.samples += gap + frames;
             Placement::Silence(gap)
         } else if diff < -(self.tolerance_ns as i64) {
@@ -146,6 +150,19 @@ impl AudioTimeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bogus_timestamp_does_not_become_hours_of_silence() {
+        let mut t = AudioTimeline::new(48_000, 10_000_000);
+        assert_eq!(t.place(0, 480), Placement::Append);
+        // the next buffer claims to start an hour later
+        assert_eq!(t.place(3_600_000_000_000, 480), Placement::Silence(480_000), "10 s at most");
+        assert_eq!(t.samples(), 480 + 480_000 + 480);
+        // a gap of 1 s is still filled whole
+        let mut t = AudioTimeline::new(48_000, 10_000_000);
+        t.place(0, 480);
+        assert_eq!(t.place(1_010_000_000, 480), Placement::Silence(48_000));
+    }
 
     #[test]
     fn media_time_is_relative_to_the_origin() {
