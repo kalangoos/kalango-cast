@@ -4,6 +4,11 @@
 
 # Kalango Cast
 
+> **Prévia técnica: o motor nunca rodou em uma sessão real.** Compila, passa nos testes de unidade e o NVENC foi
+> exercitado numa RTX 3090 com quadros sintéticos; a captura do niri, o som, a sincronia e uma gravação de ponta a
+> ponta **nunca foram executados**. Veja "Estado real" abaixo antes de confiar em qualquer coisa daqui. Licença:
+> GPL-3.0-or-later (`LICENSE`); terceiros em `NOTICE`.
+
 O estúdio de gravação e transmissão do [KalangoOS](https://github.com/kalangoos/kalangoos): nativo, em Rust, feito
 para gastar o mínimo da máquina — a captura, a composição e a codificação ficam na GPU, sem cópias pela CPU.
 

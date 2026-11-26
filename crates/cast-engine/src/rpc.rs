@@ -892,6 +892,8 @@ mod tests {
     }
 
     fn read_reply(c: &UnixStream) -> Value {
+        // a daemon that does not answer fails the test instead of hanging it
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut line = String::new();
         BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line:?}"))
