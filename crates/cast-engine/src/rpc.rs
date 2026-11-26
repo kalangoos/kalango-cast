@@ -3,7 +3,8 @@
 //! `SO_PEERCRED`: only processes of the same user are served.
 //!
 //! Methods: `capabilities`, `sources.list`, `record.start` {source, path, encoder?, codec?, fps?, bitrate_kbps?,
-//! desktop_audio?, mic?, overwrite?}, `record.stop`, `record.status`, `consent.approve` {token}.
+//! desktop_audio?, mic?, overwrite?}, `record.stop`, `record.status`, `consent.approve` {token},
+//! `consent.deny` {token}, `consent.handler.register`.
 //!
 //! **Consent.** Being the same user is not consent: any program of the person's could otherwise start recording the
 //! screen and the microphone. With `consent = "ask"` (the default; `$XDG_CONFIG_HOME/kalango/cast.toml`), `record.start`
@@ -12,13 +13,23 @@
 //! `kalango-cast approve CODE`, and the same `record.start` is then accepted once. This stops clients that cannot see
 //! the terminal (agents through kalangod, scripts); it does **not** stop a hostile program of the same user that can
 //! read the terminal or the daemon's memory.
+//!
+//! **A UI as the consent handler.** A trusted UI (`kalango-cast-app`) can register its connection with
+//! `consent.handler.register` (the peer's uid is checked again: only the daemon's own user). From then on the
+//! approval code and the recording's lifecycle are pushed to that connection as JSON-RPC notifications (`method`
+//! "event", `params.type` = `consent_requested` {what, token, ttl_s} | `recording_started` | `recording_stopped` |
+//! `recording_failed`), the code is **no longer printed on the terminal**, and `consent.approve`/`consent.deny` are
+//! accepted **only from that connection**. Without a registered handler (or when its connection is gone or stuck) the
+//! terminal channel is used exactly as before. Only one handler at a time: a second registration is refused while
+//! the first connection lives. The handler is as trusted as the terminal was: a hostile program of the same user
+//! that registers first would receive the codes (see the README, "O que NÃO está feito").
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -155,12 +166,33 @@ impl Default for Limits {
 
 struct Pending {
     token: String,
+    /// What the person was asked to approve (kept to hand it to a handler that registers later).
+    what: String,
     /// The request that was held (its parameters, as text): the approval is for this one only.
     fingerprint: String,
     created: Instant,
     approved: bool,
     wrong: u32,
 }
+
+/// The write side of a connection, shared between its own thread (replies) and the daemon (pushed events).
+type SharedOut = Arc<Mutex<UnixStream>>;
+
+/// What a request knows about the connection it came on.
+pub struct ConnCtx {
+    id: u64,
+    uid: Option<u32>,
+    out: SharedOut,
+}
+
+/// The connection registered as the consent handler.
+struct HandlerSlot {
+    conn: u64,
+    out: SharedOut,
+}
+
+/// How long a pushed event may block on a handler that does not read before it is dropped as dead.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The daemon's state: at most one recording.
 #[derive(Default)]
@@ -172,6 +204,8 @@ pub struct Daemon {
     hook: Option<Hook>,
     limits: Limits,
     active: AtomicUsize,
+    handler: Mutex<Option<HandlerSlot>>,
+    next_conn: AtomicU64,
 }
 
 impl Daemon {
@@ -195,10 +229,89 @@ impl Daemon {
         self
     }
 
+    /// Tells the trusted channels: the registered UI first (every event), the hook (the terminal) for everything
+    /// except an approval code a UI took.
     fn emit(&self, e: Event) {
+        let delivered = self.push_to_handler(&e);
+        if delivered && matches!(e, Event::ConsentRequested { .. }) {
+            return;
+        }
         if let Some(h) = &self.hook {
             h(&e);
         }
+    }
+
+    /// Sends an event to the consent handler; a handler that cannot take it is dropped (the terminal takes over).
+    fn push_to_handler(&self, e: &Event) -> bool {
+        let Ok(mut slot) = self.handler.lock() else { return false };
+        let Some(h) = slot.as_ref() else { return false };
+        let note = json!({"jsonrpc": "2.0", "method": "event", "params": event_json(e, self.limits.ttl)});
+        let sent = h.out.lock().map(|mut out| writeln!(out, "{note}").is_ok()).unwrap_or(false);
+        if !sent {
+            *slot = None;
+        }
+        sent
+    }
+
+    /// Whether `ctx` may approve or deny: with a handler registered, only its connection; otherwise anyone who
+    /// holds the code (the terminal flow).
+    fn may_decide(&self, ctx: Option<&ConnCtx>) -> Result<(), RpcError> {
+        let slot = self.handler.lock().map_err(|_| (-32000, "lock".to_string()))?;
+        match (slot.as_ref(), ctx) {
+            (None, _) => Ok(()),
+            (Some(h), Some(c)) if h.conn == c.id => Ok(()),
+            _ => Err((NOT_HANDLER, tr("Only the registered consent handler may decide").to_string())),
+        }
+    }
+
+    fn register_handler(&self, ctx: Option<&ConnCtx>) -> Result<Value, RpcError> {
+        let ctx = ctx.ok_or((NOT_HANDLER, tr("A handler must be a socket connection").to_string()))?;
+        if !peer_allowed(ctx.uid, my_uid()) {
+            return Err((NOT_HANDLER, tr("Only the daemon's own user may handle consent").to_string()));
+        }
+        {
+            let mut slot = self.handler.lock().map_err(|_| (-32000, "lock".to_string()))?;
+            if let Some(h) = slot.as_ref() {
+                if h.conn != ctx.id {
+                    return Err((NOT_HANDLER, tr("A consent handler is already registered").to_string()));
+                }
+            }
+            if let Ok(out) = ctx.out.lock() {
+                let _ = out.set_write_timeout(Some(PUSH_TIMEOUT));
+            }
+            *slot = Some(HandlerSlot { conn: ctx.id, out: ctx.out.clone() });
+        }
+        // a request that was held before the UI registered is handed over now (the terminal's notice stands too)
+        let waiting = self.pending.lock().ok().and_then(|p| {
+            p.as_ref()
+                .filter(|p| !p.approved && p.created.elapsed() <= self.limits.ttl)
+                .map(|p| Event::ConsentRequested { what: p.what.clone(), token: p.token.clone() })
+        });
+        if let Some(e) = waiting {
+            self.push_to_handler(&e);
+        }
+        Ok(json!({"registered": true}))
+    }
+
+    /// The connection ended: it stops being the handler.
+    fn connection_closed(&self, id: u64) {
+        if let Ok(mut slot) = self.handler.lock() {
+            if slot.as_ref().is_some_and(|h| h.conn == id) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+/// The error code of a consent decision or registration by a connection that may not make it.
+pub const NOT_HANDLER: i64 = -32003;
+
+fn event_json(e: &Event, ttl: Duration) -> Value {
+    match e {
+        Event::ConsentRequested { what, token } => json!({"type": "consent_requested", "what": what, "token": token, "ttl_s": ttl.as_secs()}),
+        Event::RecordingStarted { path } => json!({"type": "recording_started", "path": path}),
+        Event::RecordingStopped { path } => json!({"type": "recording_stopped", "path": path}),
+        Event::RecordingFailed { path, error } => json!({"type": "recording_failed", "path": path, "error": error}),
     }
 }
 
@@ -321,6 +434,11 @@ fn describe(o: &RecordOptions) -> String {
 impl Daemon {
     /// Answers one JSON-RPC request (a notification without id gets no answer).
     pub fn handle(&self, line: &str) -> Option<Value> {
+        self.handle_from(None, line)
+    }
+
+    /// Like [`Daemon::handle`], for a request that came on a connection (`None`: no connection, as in tests).
+    pub fn handle_from(&self, ctx: Option<&ConnCtx>, line: &str) -> Option<Value> {
         let req: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => return Some(error(&Value::Null, -32700, format!("{}: {e}", tr("Invalid JSON")))),
@@ -328,7 +446,7 @@ impl Daemon {
         let id = req.get("id").cloned();
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = req.get("params").cloned().unwrap_or(json!({}));
-        let result = self.call(method, &params);
+        let result = self.call(ctx, method, &params);
         let id = id?;
         Some(match result {
             Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
@@ -357,7 +475,7 @@ impl Daemon {
             Some(p) if !p.approved && p.fingerprint == fingerprint => {}
             _ => {
                 let token = new_token()?;
-                *slot = Some(Pending { token: token.clone(), fingerprint, created: Instant::now(), approved: false, wrong: 0 });
+                *slot = Some(Pending { token: token.clone(), what: what.clone(), fingerprint, created: Instant::now(), approved: false, wrong: 0 });
                 self.emit(Event::ConsentRequested { what, token });
             }
         }
@@ -384,7 +502,20 @@ impl Daemon {
         Ok(json!({"approved": true}))
     }
 
-    fn call(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+    /// The person said no: the held request is dropped (a new `record.start` asks again, with a new code).
+    fn deny(&self, params: &Value) -> Result<Value, RpcError> {
+        let token = params.get("token").and_then(|t| t.as_str()).ok_or((-32602, "token".to_string()))?;
+        let mut slot = self.pending.lock().map_err(|_| (-32000, "lock".to_string()))?;
+        match slot.as_ref() {
+            Some(p) if p.token == token && p.created.elapsed() <= self.limits.ttl => {
+                *slot = None;
+                Ok(json!({"denied": true}))
+            }
+            _ => Err((-32002, tr("Invalid or expired approval code").to_string())),
+        }
+    }
+
+    fn call(&self, ctx: Option<&ConnCtx>, method: &str, params: &Value) -> Result<Value, RpcError> {
         let app = |e: String| (-32000, e);
         match method {
             "capabilities" => Ok(json!({
@@ -393,13 +524,22 @@ impl Daemon {
                 "audio": {"codec": "opus", "sample_rate": 48000, "channels": 2},
                 "container": "mp4 (fragmented)",
                 "consent": match self.consent { Consent::Ask => "ask", Consent::Allow => "allow" },
+                "consent_handler": self.handler.lock().map(|h| h.is_some()).unwrap_or(false),
             })),
             "sources.list" => {
                 let cast = cast_capture::ScreenCast::connect(self.dbus_address.as_deref()).map_err(|e| app(e.0))?;
                 let s = cast.sources().map_err(|e| app(e.0))?;
                 serde_json::to_value(s).map_err(|e| app(e.to_string()))
             }
-            "consent.approve" => self.approve(params),
+            "consent.approve" => {
+                self.may_decide(ctx)?;
+                self.approve(params)
+            }
+            "consent.deny" => {
+                self.may_decide(ctx)?;
+                self.deny(params)
+            }
+            "consent.handler.register" => self.register_handler(ctx),
             "record.start" => {
                 let mut o = parse_start(params)?;
                 o.dbus_address = self.dbus_address.clone();
@@ -467,8 +607,9 @@ impl Daemon {
                 continue;
             }
             let d = self.clone();
+            let uid = peer_uid(&conn);
             let spawned = std::thread::Builder::new().name("cast-rpc".into()).spawn(move || {
-                d.client(conn);
+                d.client(conn, uid);
                 d.active.fetch_sub(1, Ordering::AcqRel);
             });
             if spawned.is_err() {
@@ -477,8 +618,15 @@ impl Daemon {
         }
     }
 
-    fn client(&self, conn: UnixStream) {
-        let Ok(mut out) = conn.try_clone() else { return };
+    fn client(&self, conn: UnixStream, uid: Option<u32>) {
+        let Ok(clone) = conn.try_clone() else { return };
+        let out: SharedOut = Arc::new(Mutex::new(clone));
+        let ctx = ConnCtx { id: self.next_conn.fetch_add(1, Ordering::Relaxed), uid, out: out.clone() };
+        self.serve_connection(conn, &ctx);
+        self.connection_closed(ctx.id);
+    }
+
+    fn serve_connection(&self, conn: UnixStream, ctx: &ConnCtx) {
         let mut reader = BufReader::new(conn);
         let mut buf = Vec::new();
         loop {
@@ -490,15 +638,18 @@ impl Daemon {
             }
             let ends = buf.last() == Some(&b'\n');
             if buf.len() - usize::from(ends) > self.limits.line {
-                let _ = writeln!(out, "{}", error(&Value::Null, -32600, tr("Request too long")));
+                if let Ok(mut o) = ctx.out.lock() {
+                    let _ = writeln!(o, "{}", error(&Value::Null, -32600, tr("Request too long")));
+                }
                 break;
             }
             let line = String::from_utf8_lossy(&buf);
             if line.trim().is_empty() {
                 continue;
             }
-            if let Some(reply) = self.handle(&line) {
-                if writeln!(out, "{reply}").is_err() {
+            if let Some(reply) = self.handle_from(Some(ctx), &line) {
+                let ok = ctx.out.lock().map(|mut o| writeln!(o, "{reply}").is_ok()).unwrap_or(false);
+                if !ok {
                     break;
                 }
             }
@@ -951,6 +1102,163 @@ mod tests {
             assert!(Instant::now() < end, "the slot was never freed");
             std::thread::sleep(Duration::from_millis(20));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake connection: its context and the peer end where pushed events can be read.
+    fn conn(id: u64, uid: u32) -> (ConnCtx, BufReader<UnixStream>) {
+        let (a, b) = UnixStream::pair().unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        (ConnCtx { id, uid: Some(uid), out: Arc::new(Mutex::new(a)) }, BufReader::new(b))
+    }
+
+    fn call_from(d: &Daemon, c: &ConnCtx, method: &str, params: Value) -> Value {
+        d.handle_from(Some(c), &json!({"jsonrpc": "2.0", "id": 9, "method": method, "params": params}).to_string()).unwrap()
+    }
+
+    fn next_event(r: &mut BufReader<UnixStream>) -> Value {
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line:?}"));
+        assert_eq!(v["method"], "event");
+        assert!(v.get("id").is_none(), "events are notifications");
+        v["params"].clone()
+    }
+
+    #[test]
+    fn a_registered_handler_gets_the_code_and_the_terminal_stays_quiet() {
+        let dir = scratch("handler");
+        let (d, log) = daemon(Consent::Ask);
+        let me = my_uid();
+        let (ui, mut ui_in) = conn(1, me);
+        let (other, _other_in) = conn(2, me);
+        assert_eq!(call_from(&d, &ui, "consent.handler.register", json!({}))["result"]["registered"], true);
+        assert_eq!(call_from(&d, &ui, "capabilities", json!({}))["result"]["consent_handler"], true);
+        let params = start_params(&dir.join("a.mp4"));
+        let r = d.handle_from(Some(&other), &json!({"jsonrpc": "2.0", "id": 1, "method": "record.start", "params": params}).to_string()).unwrap();
+        assert_eq!(r["error"]["code"], CONSENT_REQUIRED, "{r}");
+        let ev = next_event(&mut ui_in);
+        assert_eq!(ev["type"], "consent_requested");
+        let token = ev["token"].as_str().unwrap().to_string();
+        assert!(ev["what"].as_str().unwrap().contains("\"a.mp4\""), "the exact description, escaped, reaches the UI");
+        assert_eq!(ev["ttl_s"], 120);
+        assert!(!r.to_string().contains(&token), "never to the client that asked");
+        assert!(log.lock().unwrap().is_empty(), "the code is not printed on the terminal while a UI handles consent");
+        // a client that is not the handler cannot approve or deny, even holding the code
+        assert_eq!(call_from(&d, &other, "consent.approve", json!({"token": token}))["error"]["code"], NOT_HANDLER);
+        assert_eq!(call_from(&d, &other, "consent.deny", json!({"token": token}))["error"]["code"], NOT_HANDLER);
+        assert_eq!(approve(&d, &token)["error"]["code"], NOT_HANDLER, "nor can a request without a connection");
+        // the handler can
+        assert_eq!(call_from(&d, &ui, "consent.approve", json!({"token": token}))["result"]["approved"], true);
+        let r = d.handle_from(Some(&other), &json!({"jsonrpc": "2.0", "id": 1, "method": "record.start", "params": params}).to_string()).unwrap();
+        assert_ne!(r["error"]["code"], CONSENT_REQUIRED, "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn denying_drops_the_request_and_the_next_start_asks_again() {
+        let dir = scratch("deny");
+        let (d, _log) = daemon(Consent::Ask);
+        let (ui, mut ui_in) = conn(1, my_uid());
+        call_from(&d, &ui, "consent.handler.register", json!({}));
+        let params = start_params(&dir.join("a.mp4"));
+        assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED);
+        let token = next_event(&mut ui_in)["token"].as_str().unwrap().to_string();
+        assert_eq!(call_from(&d, &ui, "consent.deny", json!({"token": token}))["result"]["denied"], true);
+        assert_eq!(call_from(&d, &ui, "consent.approve", json!({"token": token}))["error"]["code"], -32002, "the denied code is dead");
+        assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED);
+        let again = next_event(&mut ui_in)["token"].as_str().unwrap().to_string();
+        assert_ne!(again, token, "a fresh code");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_daemons_own_user_can_register_and_only_one_handler_at_a_time() {
+        let (d, _log) = daemon(Consent::Ask);
+        let me = my_uid();
+        let (stranger, _s) = conn(1, me.wrapping_add(1));
+        assert_eq!(call_from(&d, &stranger, "consent.handler.register", json!({}))["error"]["code"], NOT_HANDLER);
+        let unknown = ConnCtx { uid: None, ..conn(3, me).0 };
+        assert_eq!(call_from(&d, &unknown, "consent.handler.register", json!({}))["error"]["code"], NOT_HANDLER);
+        assert_eq!(d.handle(r#"{"jsonrpc":"2.0","id":1,"method":"consent.handler.register"}"#).unwrap()["error"]["code"], NOT_HANDLER);
+        assert_eq!(call_from(&d, &stranger, "capabilities", json!({}))["result"]["consent_handler"], false, "nothing registered");
+        let (first, _f) = conn(4, me);
+        let (second, _g) = conn(5, me);
+        assert_eq!(call_from(&d, &first, "consent.handler.register", json!({}))["result"]["registered"], true);
+        assert_eq!(call_from(&d, &second, "consent.handler.register", json!({}))["error"]["code"], NOT_HANDLER, "no hijacking a live handler");
+        assert_eq!(call_from(&d, &first, "consent.handler.register", json!({}))["result"]["registered"], true, "the same one may repeat");
+    }
+
+    #[test]
+    fn without_a_handler_or_after_it_leaves_the_terminal_gets_the_code() {
+        let dir = scratch("fallback");
+        let (d, log) = daemon(Consent::Ask);
+        let params = start_params(&dir.join("a.mp4"));
+        assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED);
+        let t1 = token_of(&log);
+        assert_eq!(approve(&d, &t1)["result"]["approved"], true, "terminal flow unchanged: whoever holds the code");
+        // a handler that registers and then goes away (its connection closes): back to the terminal
+        let (ui, ui_in) = conn(1, my_uid());
+        call_from(&d, &ui, "consent.handler.register", json!({}));
+        d.connection_closed(1);
+        drop(ui_in);
+        let b = start_params(&dir.join("b.mp4"));
+        assert_eq!(start(&d, &b)["error"]["code"], CONSENT_REQUIRED);
+        assert_eq!(log.lock().unwrap().len(), 2);
+        assert_ne!(token_of(&log), t1);
+        // a handler whose connection is dead without being closed is dropped on the first push
+        let (ui2, ui2_in) = conn(2, my_uid());
+        call_from(&d, &ui2, "consent.handler.register", json!({}));
+        drop(ui2_in);
+        let c = start_params(&dir.join("c.mp4"));
+        assert_eq!(start(&d, &c)["error"]["code"], CONSENT_REQUIRED);
+        assert_eq!(log.lock().unwrap().len(), 3, "the dead handler did not swallow the code");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_request_held_before_the_ui_registered_is_handed_over() {
+        let dir = scratch("late");
+        let (d, log) = daemon(Consent::Ask);
+        assert_eq!(start(&d, &start_params(&dir.join("a.mp4")))["error"]["code"], CONSENT_REQUIRED);
+        let token = token_of(&log);
+        let (ui, mut ui_in) = conn(1, my_uid());
+        call_from(&d, &ui, "consent.handler.register", json!({}));
+        let ev = next_event(&mut ui_in);
+        assert_eq!(ev["token"], token.as_str());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_handler_works_over_the_real_socket_and_lifecycle_events_follow() {
+        let dir = scratch("handler-sock");
+        let sock = dir.join("kalango").join("cast.sock");
+        let listener = bind(&sock).unwrap();
+        let d = Arc::new(daemon(Consent::Ask).0);
+        let d2 = d.clone();
+        std::thread::spawn(move || d2.serve(listener));
+        let mut ui = UnixStream::connect(&sock).unwrap();
+        ui.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut ui_in = BufReader::new(ui.try_clone().unwrap());
+        writeln!(ui, r#"{{"jsonrpc":"2.0","id":1,"method":"consent.handler.register"}}"#).unwrap();
+        let mut line = String::new();
+        ui_in.read_line(&mut line).unwrap();
+        assert!(line.contains("registered"), "{line}");
+        let params = start_params(&dir.join("a.mp4"));
+        let r = request(&sock, "record.start", params.clone()).unwrap();
+        assert_eq!(r["error"]["code"], CONSENT_REQUIRED);
+        let ev = next_event(&mut ui_in);
+        let token = ev["token"].as_str().unwrap().to_string();
+        // another connection of the same user holding the code still cannot approve
+        let r = request(&sock, "consent.approve", json!({"token": token})).unwrap();
+        assert_eq!(r["error"]["code"], NOT_HANDLER, "{r}");
+        writeln!(ui, "{}", json!({"jsonrpc":"2.0","id":2,"method":"consent.approve","params":{"token":token}})).unwrap();
+        line.clear();
+        ui_in.read_line(&mut line).unwrap();
+        assert!(line.contains("approved"), "{line}");
+        // the approved start reaches the engine (and fails on the missing bus: a failed start is no event)
+        let r = request(&sock, "record.start", params).unwrap();
+        assert_ne!(r["error"]["code"], CONSENT_REQUIRED, "{r}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

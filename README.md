@@ -12,9 +12,10 @@
 O estúdio de gravação e transmissão do [KalangoOS](https://github.com/kalangoos/kalangoos): nativo, em Rust, feito
 para gastar o mínimo da máquina — a captura, a composição e a codificação ficam na GPU, sem cópias pela CPU.
 
-Este repositório tem, por enquanto, o **motor** (fase 1): grava um monitor, uma janela ou uma área da tela, com o som
-do computador e o microfone, num MP4 que sobrevive a quedas. A interface do estúdio (os desenhos estão no Design
-System do KalangoOS, página "34 · Kalango Cast") vem nas próximas fases.
+Este repositório tem o **motor** (fase 1): grava um monitor, uma janela ou uma área da tela, com o som do computador
+e o microfone, num MP4 que sobrevive a quedas; e uma **primeira janela** (`kalango-cast-app`, GTK4) que fala com o
+serviço. A janela é só o começo do estúdio desenhado no Design System do KalangoOS (página "34 · Kalango Cast"): não
+há cenas com várias fontes, mixer, transmissão nem Diretor IA ainda.
 
 ## Estado real (leia primeiro)
 
@@ -29,8 +30,11 @@ O código compila e passa no `clippy -D warnings` e nos testes de unidade. Pouco
 | Sincronia de áudio e vídeo, latência de ponta a ponta, uso de CPU/GPU em gravação real | **nunca medidos**; [`docs/DESEMPENHO.md`](docs/DESEMPENHO.md) descreve o método e traz só o que foi medido |
 | VA-API (AMD, Intel), OpenH264 | só a detecção do VA-API existe; o OpenH264 não foi rodado (o download conferido tem teste `#[ignore]`, `KALANGO_CAST_OPENH264_NET=1`) |
 
+| **Janela `kalango-cast-app`** (GTK4) | **abre e funciona numa sessão niri aninhada do KalangoOS** (capturas em [`docs/capturas/`](docs/capturas/)); **sem captura**: o niri aninhado em que foi aberta não oferece o ScreenCast (`org.gnome.Mutter.DisplayConfig` ausente no barramento dele), então a janela mostrou, de verdade, "A captura não está disponível nesta sessão" e o botão Gravar ficou desligado. **Nenhuma gravação foi feita pela janela**, nem com o niri com o patch de `tests/niri/` |
+| Consentimento pela janela | testado com o código do serviço de verdade (testes de unidade e de integração: o código chega só à janela, outro cliente não aprova, negar derruba o pedido); na sessão aninhada o diálogo apareceu para um pedido feito por `kalango-cast rpc record.start`, mas **ninguém clicou Permitir/Negar nessa sessão** (sem ferramenta de clique) |
+
 Testes que dependem de máquina, rede ou compositor são `#[ignore]` e dizem a variável de ambiente que os liga:
-`KALANGO_CAST_GPU` (NVENC), `KALANGO_CAST_OPENH264_NET` (download), `KALANGO_CAST_NIRI` (sessão completa).
+`KALANGO_CAST_GPU` (NVENC), `KALANGO_CAST_OPENH264_NET` (download), `KALANGO_CAST_NIRI` (sessão completa) e `KALANGO_CASTD` (a janela iniciando o `kalango-castd` de verdade como processo filho).
 A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, não o que foi verificado.
 
 ## O que o código foi escrito para fazer
@@ -61,8 +65,18 @@ A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, 
   (válido 120 s, cancelado após 5 erros, só para aquele pedido) aparece **apenas** no terminal do `kalango-castd`
   (o `Hook` do daemon), e a pessoa roda `kalango-cast approve CÓDIGO`; o mesmo `record.start` passa uma vez. O
   `kalango-cast record` na linha de comando é a própria pessoa pedindo e não passa por isso.
-- **Indicador (parcial)**: o daemon avisa início, fim e falha da gravação ao `Hook` (impresso no terminal do
-  `kalango-castd`); **não há indicador na tela nem sinal D-Bus ainda**.
+- **Consentimento pela janela (feito)**: a `kalango-cast-app` se registra como **quem trata o consentimento**
+  (`consent.handler.register`, com a checagem do uid de quem conecta). Enquanto ela está registrada, o código e a
+  descrição do pedido (a origem, o som, o microfone, a pasta e o arquivo, escapados pelo motor) vão **só para ela**,
+  como notificações JSON-RPC (`method` "event"); **não são mais impressos no terminal**, e só a conexão registrada
+  aprova (`consent.approve`) ou nega (`consent.deny`); outro cliente, mesmo com o código, recebe -32003. A janela
+  mostra o diálogo "Permitir gravar a tela/microfone?" também para pedidos de **outros programas** (um agente, um
+  script), porque ninguém mais consegue responder. Sem janela registrada (ou se ela morrer ou travar) vale o terminal,
+  exatamente como antes (`kalango-cast approve CÓDIGO`). Um só tratador por vez; um programa hostil da mesma pessoa
+  que se registrasse antes da janela receberia os códigos (é a mesma confiança que o terminal já exigia).
+- **Indicador**: o daemon avisa início, fim e falha da gravação ao `Hook` (impresso no terminal do `kalango-castd`)
+  e à janela registrada; a **janela tem um indicador sempre visível** (ponto vermelho e cronômetro no alto, fora de
+  qualquer rolagem). **Não há indicador do sistema (ilha da barra) nem sinal D-Bus ainda.**
 - **Arquivo de saída** (a pasta precisa ser **sua**: `/tmp`, que é do root, é recusado, com o motivo na resposta;
   use por exemplo `~/Videos`): criado com `O_EXCL|O_NOFOLLOW` (modo 0600) numa pasta que seja sua e não seja um link; só
   termina em `.mp4`, sem `..`; `overwrite` só troca uma gravação nossa anterior (arquivo comum seu, com um só nome,
@@ -71,6 +85,31 @@ A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, 
   daemon (ou edite o `cast.toml` para `allow`); não há diálogo do compositor por janela, nem registro de auditoria,
   nem limite de tempo ocioso nas conexões, nem aviso de que o microfone está aberto fora do daemon; as pastas
   *acima* da pasta de saída podem ser links; o conteúdo gravado não é cifrado.
+
+## A janela (`kalango-cast-app`)
+
+- **O que mostra**: no alto, o indicador (ponto, estado, cronômetro quando grava), o estado do serviço e o botão
+  Gravar/Parar; à esquerda, as **cenas** (perfis Gamer, Trabalho e Podcast: só mudam a configuração do motor,
+  quadros/s, taxa de bits e quais sons) e as **fontes** (monitores e janelas que o niri oferece); à direita, cartões
+  que se arrumam em quantas colunas couberem (prévia, saúde da gravação com quadros/s, perdidos, codificador, taxa
+  de bits, tamanho, CPU e GPU, e a saída com a pasta, `~/Vídeos` por padrão, que precisa ser sua). Em janela estreita
+  a barra lateral vai para cima dos cartões.
+- **A prévia não é uma imagem**: o motor ainda não manda quadros para a janela. A área diz, com o motivo real, se a
+  captura está disponível, se faltam fontes ou se o serviço não está lá; durante a gravação diz o tamanho e o
+  codificador. Nada é simulado.
+- **Serviço**: se o `kalango-castd` não responde no socket da pessoa, a janela o inicia como processo filho (sem
+  shell, o socket é o do `$XDG_RUNTIME_DIR`, a saída vai para `castd.log` na mesma pasta) e o encerra ao sair, só se
+  ela mesma o iniciou. Fechar a janela durante uma gravação a termina antes.
+- **Movimento**: molas simples implementadas no aplicativo (`motion.rs`, sem depender de outro repositório); o relógio
+  de quadros só roda enquanto algo se mexe.
+- **Textos**: `tr()` do `cast-core` com o catálogo pt_BR (`locales/pt_BR/app.json`); as outras 7 línguas do KalangoOS
+  virão depois. Só o tema escuro por enquanto; o claro virá.
+- **Ver agora**: `cargo run -p kalango-cast-app` no desktop do computador, ou `scripts/ver-no-niri.sh` para abrir
+  na sessão niri aninhada do KalangoOS que já está rodando (descobre o socket Wayland e o barramento D-Bus dela; não
+  reinicia nada). `.desktop` e ícone: `crates/kalango-cast-app/dist/` e `assets/logo-kalango-cast.png`.
+- **O que não faz**: várias fontes e cenas compostas, mixer, transmissão, gravação ISO, atalhos, Diretor IA; não
+  mostra a imagem ao vivo; não escolhe codificador nem codec (H.264 e o melhor disponível); a escolha de fonte
+  só tem monitor inteiro ou janela (a área está no serviço, não na janela).
 
 ## Usar
 
@@ -91,7 +130,8 @@ target/release/kalango-cast rpc record.stop
 
 Métodos do serviço: `capabilities`, `sources.list`, `record.start` (`source`, `path`, e opcionais `encoder`,
 `codec`, `fps`, `bitrate_kbps`, `desktop_audio`, `mic`, `overwrite`), `record.status` (quadros por segundo,
-perdidos, codificador, latência, taxa de bits, CPU, GPU) e `record.stop`.
+perdidos, codificador, latência, taxa de bits, CPU, GPU), `record.stop`, e o consentimento: `consent.approve` e
+`consent.deny` (`token`) e `consent.handler.register` (para a janela; veja "Privacidade e consentimento").
 
 ## Peças
 
@@ -102,11 +142,12 @@ perdidos, codificador, latência, taxa de bits, CPU, GPU) e `record.stop`.
 | `cast-encode` | NVENC (OpenGL ↔ NVENC), sonda da VA-API, OpenH264 (download conferido), Opus |
 | `cast-mux` | O gravador de MP4 fragmentado, e um leitor para conferir arquivos |
 | `cast-engine` | O motor, o serviço `kalango-castd` e a linha de comando `kalango-cast` |
+| `kalango-cast-app` | A janela GTK4 (`kalango-cast-app`): máquina de estados pura (`model.rs`), cliente do socket, ciclo de vida do daemon, molas |
 | `cast-testkit` | Sessão niri aninhada, claquete, análise de sincronia, benchmark (só para testes) |
 
 ## Desenvolver
 
-Precisa de `libpipewire-0.3-dev`, `libclang-dev` e `pkg-config` para compilar; `ffmpeg` para alguns testes. As regras
+Precisa de `libpipewire-0.3-dev`, `libclang-dev`, `libgtk-4-dev` (a janela) e `pkg-config` para compilar; `ffmpeg` para alguns testes. As regras
 são as do KalangoOS (veja `AGENTS.md`). O teste de ponta a ponta com um niri de verdade está em
 `crates/cast-testkit/tests/niri_session.rs` e o patch do niri que ele usa em `tests/niri/`.
 

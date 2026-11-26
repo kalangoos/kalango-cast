@@ -15,6 +15,7 @@ const PT_BR: &[(&str, &str)] = &[
     ("codificacao", include_str!("../locales/pt_BR/codificacao.json")),
     ("motor", include_str!("../locales/pt_BR/motor.json")),
     ("cli", include_str!("../locales/pt_BR/cli.json")),
+    ("app", include_str!("../locales/pt_BR/app.json")),
 ];
 
 const LOCALES: &[&str] = &["pt_BR"];

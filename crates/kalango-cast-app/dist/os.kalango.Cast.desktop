@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Kalango Cast
+GenericName=Estúdio de gravação e transmissão
+Comment=Grave a tela, janelas e o som do computador e do microfone
+Exec=kalango-cast-app
+Icon=os.kalango.Cast
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=gravar;tela;transmitir;stream;captura;podcast;
+StartupWMClass=os.kalango.Cast
