@@ -19,15 +19,12 @@
 //! approval code and the recording's lifecycle are pushed to that connection as JSON-RPC notifications (`method`
 //! "event", `params.type` = `consent_requested` {what, token, ttl_s} | `recording_started` | `recording_stopped` |
 //! `recording_failed`), the code is **no longer printed on the terminal**, and `consent.approve`/`consent.deny` are
-//! accepted **only from that connection**. **Registration is authenticated** (see [`Daemon::authenticate`]): when the
-//! app spawned the daemon it passed a random secret over an inherited pipe (`--secret-fd`), and `register` must
-//! present it (`params.secret`, constant-time compare); the peer's executable must also be a trusted install
-//! (root-owned, not user-writable, checked through pidfd and `/proc/<pid>/exe`) unless `KALANGO_CAST_DEV=1`. A daemon
-//! the app did not spawn accepts no handler unless the executable check passes (or dev mode). Nothing is handed over,
-//! and the terminal notice is not silenced, before authentication succeeds. Without a registered handler (or when its connection is gone or stuck) the
-//! terminal channel is used exactly as before. Only one handler at a time: a second registration is refused while
-//! the first connection lives. The handler is as trusted as the terminal was: a hostile program of the same user
-//! that registers first would receive the codes (see the README, "O que NÃO está feito").
+//! accepted **only from that connection**. **Registration needs a secret**: only the app that spawned the daemon has
+//! it (it hands it over on a socketpair after the daemon says it is ready, see [`receive_secret`]), and `register`
+//! must present it (`params.secret`, constant-time compare). A daemon that was not given a secret (started by systemd
+//! or by hand) has **no handler at all**: consent stays on the terminal/journal path. The peer's executable is not a
+//! credential and is not looked at. Nothing is handed over, and the terminal notice is not silenced, before
+//! authentication succeeds.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -91,88 +88,54 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Reads the handler secret the parent left in an inherited pipe (`--secret-fd N`) and closes it. At most 256 bytes.
-pub fn read_secret_from_fd(fd: i32) -> std::io::Result<String> {
+/// Overwrites a buffer with zeros in a way the compiler may not remove.
+pub fn zeroize(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, exclusive reference to a byte.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+/// The daemon's half of the secret handshake on the socketpair end `fd` the parent left us (`--secret-fd N`): says
+/// "ready" with one byte, then reads the secret the parent sends (up to 256 bytes, until it closes its writing side),
+/// zeroizes its buffers and closes the descriptor. The caller must already have set `PR_SET_DUMPABLE` to 0: the
+/// parent sends the secret only after reading the ready byte, so nothing secret exists before that point.
+pub fn receive_secret(fd: i32, timeout: Duration) -> std::io::Result<String> {
     use std::os::fd::FromRawFd;
     // SAFETY: the parent passed this descriptor to us for this one purpose and nothing else in the process uses it;
-    // the File takes ownership and closes it when dropped.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut buf = String::new();
-    file.take(256).read_to_string(&mut buf)?;
-    let secret = buf.trim().to_string();
-    if secret.len() < 16 {
-        return Err(std::io::Error::other("the handler secret is too short"));
-    }
-    Ok(secret)
-}
-
-/// The installs a consent handler may run from: root-owned places the user cannot write.
-pub fn default_trusted_exes() -> Vec<PathBuf> {
-    ["/usr/bin/kalango-cast-app", "/usr/libexec/kalango-cast/kalango-cast-app", "/opt/kalango-cast/bin/kalango-cast-app"]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect()
-}
-
-/// A trusted install: under /usr or /opt, and the file and every folder above it owned by root and not writable by
-/// group or others. Returns the file's (device, inode).
-fn trusted_file_id(path: &Path) -> Result<(u64, u64), String> {
-    let real = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
-    if !(real.starts_with("/usr") || real.starts_with("/opt")) {
-        return Err("outside /usr and /opt".into());
-    }
-    for p in real.ancestors() {
-        let m = std::fs::metadata(p).map_err(|e| e.to_string())?;
-        if m.uid() != 0 || m.mode() & 0o022 != 0 {
-            return Err(format!("{} is not root-owned and closed to writes", p.display()));
-        }
-    }
-    let m = std::fs::metadata(&real).map_err(|e| e.to_string())?;
-    Ok((m.dev(), m.ino()))
-}
-
-/// Checks that process `pid` runs one of the `trusted` executables: opens a pidfd first (so the pid cannot be
-/// reused under us), refuses a deleted or replaced executable, compares device and inode of `/proc/<pid>/exe` with
-/// the trusted file, and confirms through the pidfd that the process is still the same one.
-pub fn verify_exe(pid: u32, trusted: &[PathBuf]) -> Result<(), String> {
-    // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor or -1.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
-    if fd < 0 {
-        return Err(format!("pidfd_open: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: fd is a fresh descriptor we own; OwnedFd closes it.
-    let pidfd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-    let link = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|e| e.to_string())?;
-    if link.to_string_lossy().ends_with(" (deleted)") {
-        return Err("the executable was deleted or replaced".into());
-    }
-    let exe = std::fs::metadata(format!("/proc/{pid}/exe")).map_err(|e| e.to_string())?;
-    let id = (exe.dev(), exe.ino());
-    let mut last = String::from("not a trusted executable");
-    let mut ok = false;
-    for t in trusted {
-        match trusted_file_id(t) {
-            Ok(tid) if tid == id => {
-                ok = true;
-                break;
+    // the UnixStream takes ownership and closes it when dropped.
+    let mut sock = unsafe { UnixStream::from_raw_fd(fd) };
+    sock.set_read_timeout(Some(timeout))?;
+    sock.set_write_timeout(Some(timeout))?;
+    sock.write_all(&[READY])?;
+    let mut buf = [0u8; 256];
+    let mut len = 0;
+    let result = loop {
+        match sock.read(&mut buf[len..]) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                len += n;
+                if len == buf.len() {
+                    break Err(std::io::Error::other("the handler secret is too long"));
+                }
             }
-            Ok(_) => {}
-            Err(e) => last = e,
+            Err(e) => break Err(e),
         }
-    }
-    // still the same process, still the same executable
-    // SAFETY: pidfd_send_signal with signal 0 only checks that the process exists.
-    let alive =
-        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, std::os::fd::AsRawFd::as_raw_fd(&pidfd), 0, std::ptr::null::<libc::c_void>(), 0) } == 0;
-    if !alive || std::fs::read_link(format!("/proc/{pid}/exe")).ok().as_deref() != Some(link.as_path()) {
-        return Err("the peer process changed".into());
-    }
-    if ok {
-        Ok(())
-    } else {
-        Err(last)
-    }
+    };
+    let secret = result.and_then(|()| {
+        let text = std::str::from_utf8(&buf[..len]).map_err(std::io::Error::other)?.trim().to_string();
+        if text.len() < 16 {
+            return Err(std::io::Error::other("the handler secret is too short"));
+        }
+        Ok(text)
+    });
+    zeroize(&mut buf);
+    secret
 }
+
+/// The byte the daemon sends when it is ready to receive the secret.
+pub const READY: u8 = b'R';
 
 /// Only a peer of the daemon's own user is served (an unknown peer is not).
 pub fn peer_allowed(peer: Option<u32>, me: u32) -> bool {
@@ -310,7 +273,6 @@ type SharedOut = Arc<Mutex<UnixStream>>;
 pub struct ConnCtx {
     id: u64,
     uid: Option<u32>,
-    pid: Option<u32>,
     out: SharedOut,
 }
 
@@ -337,10 +299,6 @@ pub struct Daemon {
     next_conn: AtomicU64,
     /// The secret the app that spawned us passed over a pipe; a handler must present it.
     handler_secret: Option<String>,
-    /// Development mode (`KALANGO_CAST_DEV=1`): the peer's executable is not checked.
-    dev_handler: bool,
-    /// The executables a handler may run from (empty: [`default_trusted_exes`]).
-    trusted_exes: Vec<PathBuf>,
 }
 
 impl Daemon {
@@ -362,18 +320,6 @@ impl Daemon {
     /// The secret a consent handler must present to register (the app that spawned this daemon holds the other copy).
     pub fn with_handler_secret(mut self, secret: String) -> Self {
         self.handler_secret = Some(secret);
-        self
-    }
-
-    /// Development mode: a handler's executable is not checked (cargo run). Loud by design: the caller logs it.
-    pub fn with_dev_handler(mut self, dev: bool) -> Self {
-        self.dev_handler = dev;
-        self
-    }
-
-    /// Replaces the list of trusted handler executables (tests).
-    pub fn with_trusted_exes(mut self, exes: Vec<PathBuf>) -> Self {
-        self.trusted_exes = exes;
         self
     }
 
@@ -417,24 +363,17 @@ impl Daemon {
         }
     }
 
-    /// Who may be the consent handler. Every factor that applies must pass, and a failure says nothing about which:
-    /// (1) the secret, when the app spawned this daemon (constant-time compare); (2) the peer's executable is a
-    /// trusted install (pidfd + `/proc/<pid>/exe`, dev+inode, root-owned and not user-writable) unless development
-    /// mode is on. A daemon without a secret therefore accepts a handler only through (2) or development mode.
-    fn authenticate(&self, ctx: &ConnCtx, params: &Value) -> Result<(), RpcError> {
+    /// Who may be the consent handler: only a connection that presents the secret the app that spawned this daemon
+    /// gave it (constant-time compare). A daemon without a secret has no handler. A failure says nothing about why.
+    fn authenticate(&self, params: &Value) -> Result<(), RpcError> {
         let refused = || (NOT_HANDLER, tr("The consent handler could not be authenticated").to_string());
-        if let Some(secret) = &self.handler_secret {
-            let presented = params.get("secret").and_then(|v| v.as_str()).unwrap_or("");
-            if !ct_eq(presented.as_bytes(), secret.as_bytes()) {
-                return Err(refused());
-            }
+        let secret = self.handler_secret.as_ref().ok_or_else(refused)?;
+        let presented = params.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+        if ct_eq(presented.as_bytes(), secret.as_bytes()) {
+            Ok(())
+        } else {
+            Err(refused())
         }
-        if self.dev_handler {
-            return Ok(());
-        }
-        let pid = ctx.pid.ok_or_else(refused)?;
-        let trusted = if self.trusted_exes.is_empty() { default_trusted_exes() } else { self.trusted_exes.clone() };
-        verify_exe(pid, &trusted).map_err(|_| refused())
     }
 
     fn register_handler(&self, ctx: Option<&ConnCtx>, params: &Value) -> Result<Value, RpcError> {
@@ -443,7 +382,7 @@ impl Daemon {
             return Err((NOT_HANDLER, tr("Only the daemon's own user may handle consent").to_string()));
         }
         // before anything is handed over or the terminal is silenced
-        self.authenticate(ctx, params)?;
+        self.authenticate(params)?;
         {
             let mut slot = self.handler.lock().map_err(|_| (-32000, "lock".to_string()))?;
             if let Some(h) = slot.as_ref() {
@@ -820,7 +759,7 @@ impl Daemon {
     fn client(&self, conn: UnixStream, cred: Option<(u32, u32)>) {
         let Ok(clone) = conn.try_clone() else { return };
         let out: SharedOut = Arc::new(Mutex::new(clone));
-        let ctx = ConnCtx { id: self.next_conn.fetch_add(1, Ordering::Relaxed), uid: cred.map(|c| c.1), pid: cred.map(|c| c.0), out: out.clone() };
+        let ctx = ConnCtx { id: self.next_conn.fetch_add(1, Ordering::Relaxed), uid: cred.map(|c| c.1), out: out.clone() };
         self.serve_connection(conn, &ctx);
         self.connection_closed(ctx.id);
     }
@@ -902,7 +841,7 @@ mod tests {
         let l2 = log.clone();
         let d = Daemon::with_bus(Some("unix:path=/nonexistent/kalango-cast-test-bus".into()))
             .with_consent(consent)
-            .with_dev_handler(true)
+            .with_handler_secret(SECRET.into())
             .with_hook(Box::new(move |e| l2.lock().unwrap().push(e.clone())));
         (d, log)
     }
@@ -1309,7 +1248,7 @@ mod tests {
     fn conn(id: u64, uid: u32) -> (ConnCtx, BufReader<UnixStream>) {
         let (a, b) = UnixStream::pair().unwrap();
         b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        (ConnCtx { id, uid: Some(uid), pid: Some(std::process::id()), out: Arc::new(Mutex::new(a)) }, BufReader::new(b))
+        (ConnCtx { id, uid: Some(uid), out: Arc::new(Mutex::new(a)) }, BufReader::new(b))
     }
 
     fn call_from(d: &Daemon, c: &ConnCtx, method: &str, params: Value) -> Value {
@@ -1332,7 +1271,7 @@ mod tests {
         let me = my_uid();
         let (ui, mut ui_in) = conn(1, me);
         let (other, _other_in) = conn(2, me);
-        assert_eq!(call_from(&d, &ui, "consent.handler.register", json!({}))["result"]["registered"], true);
+        assert_eq!(call_from(&d, &ui, "consent.handler.register", json!({"secret": SECRET}))["result"]["registered"], true);
         assert_eq!(call_from(&d, &ui, "capabilities", json!({}))["result"]["consent_handler"], true);
         let params = start_params(&dir.join("a.mp4"));
         let r = d.handle_from(Some(&other), &json!({"jsonrpc": "2.0", "id": 1, "method": "record.start", "params": params}).to_string()).unwrap();
@@ -1360,7 +1299,7 @@ mod tests {
         let dir = scratch("deny");
         let (d, _log) = daemon(Consent::Ask);
         let (ui, mut ui_in) = conn(1, my_uid());
-        call_from(&d, &ui, "consent.handler.register", json!({}));
+        call_from(&d, &ui, "consent.handler.register", json!({"secret": SECRET}));
         let params = start_params(&dir.join("a.mp4"));
         assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED);
         let token = next_event(&mut ui_in)["token"].as_str().unwrap().to_string();
@@ -1377,16 +1316,24 @@ mod tests {
         let (d, _log) = daemon(Consent::Ask);
         let me = my_uid();
         let (stranger, _s) = conn(1, me.wrapping_add(1));
-        assert_eq!(call_from(&d, &stranger, "consent.handler.register", json!({}))["error"]["code"], NOT_HANDLER);
+        assert_eq!(call_from(&d, &stranger, "consent.handler.register", json!({"secret": SECRET}))["error"]["code"], NOT_HANDLER);
         let unknown = ConnCtx { uid: None, ..conn(3, me).0 };
-        assert_eq!(call_from(&d, &unknown, "consent.handler.register", json!({}))["error"]["code"], NOT_HANDLER);
+        assert_eq!(call_from(&d, &unknown, "consent.handler.register", json!({"secret": SECRET}))["error"]["code"], NOT_HANDLER);
         assert_eq!(d.handle(r#"{"jsonrpc":"2.0","id":1,"method":"consent.handler.register"}"#).unwrap()["error"]["code"], NOT_HANDLER);
         assert_eq!(call_from(&d, &stranger, "capabilities", json!({}))["result"]["consent_handler"], false, "nothing registered");
         let (first, _f) = conn(4, me);
         let (second, _g) = conn(5, me);
-        assert_eq!(call_from(&d, &first, "consent.handler.register", json!({}))["result"]["registered"], true);
-        assert_eq!(call_from(&d, &second, "consent.handler.register", json!({}))["error"]["code"], NOT_HANDLER, "no hijacking a live handler");
-        assert_eq!(call_from(&d, &first, "consent.handler.register", json!({}))["result"]["registered"], true, "the same one may repeat");
+        assert_eq!(call_from(&d, &first, "consent.handler.register", json!({"secret": SECRET}))["result"]["registered"], true);
+        assert_eq!(
+            call_from(&d, &second, "consent.handler.register", json!({"secret": SECRET}))["error"]["code"],
+            NOT_HANDLER,
+            "no hijacking a live handler"
+        );
+        assert_eq!(
+            call_from(&d, &first, "consent.handler.register", json!({"secret": SECRET}))["result"]["registered"],
+            true,
+            "the same one may repeat"
+        );
     }
 
     #[test]
@@ -1399,7 +1346,7 @@ mod tests {
         assert_eq!(approve(&d, &t1)["result"]["approved"], true, "terminal flow unchanged: whoever holds the code");
         // a handler that registers and then goes away (its connection closes): back to the terminal
         let (ui, ui_in) = conn(1, my_uid());
-        call_from(&d, &ui, "consent.handler.register", json!({}));
+        call_from(&d, &ui, "consent.handler.register", json!({"secret": SECRET}));
         d.connection_closed(1);
         drop(ui_in);
         let b = start_params(&dir.join("b.mp4"));
@@ -1408,7 +1355,7 @@ mod tests {
         assert_ne!(token_of(&log), t1);
         // a handler whose connection is dead without being closed is dropped on the first push
         let (ui2, ui2_in) = conn(2, my_uid());
-        call_from(&d, &ui2, "consent.handler.register", json!({}));
+        call_from(&d, &ui2, "consent.handler.register", json!({"secret": SECRET}));
         drop(ui2_in);
         let c = start_params(&dir.join("c.mp4"));
         assert_eq!(start(&d, &c)["error"]["code"], CONSENT_REQUIRED);
@@ -1424,7 +1371,7 @@ mod tests {
         assert_eq!(start(&d, &start_params(&dir.join("a.mp4")))["error"]["code"], CONSENT_REQUIRED);
         let token = token_of(&log);
         let (ui, mut ui_in) = conn(1, my_uid());
-        call_from(&d, &ui, "consent.handler.register", json!({}));
+        call_from(&d, &ui, "consent.handler.register", json!({"secret": SECRET}));
         let ev = next_event(&mut ui_in);
         assert_eq!(ev["token"], token.as_str());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1441,7 +1388,7 @@ mod tests {
         let mut ui = UnixStream::connect(&sock).unwrap();
         ui.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut ui_in = BufReader::new(ui.try_clone().unwrap());
-        writeln!(ui, r#"{{"jsonrpc":"2.0","id":1,"method":"consent.handler.register"}}"#).unwrap();
+        writeln!(ui, "{}", json!({"jsonrpc":"2.0","id":1,"method":"consent.handler.register","params":{"secret": SECRET}})).unwrap();
         let mut line = String::new();
         ui_in.read_line(&mut line).unwrap();
         assert!(line.contains("registered"), "{line}");
@@ -1473,8 +1420,6 @@ mod tests {
         let l2 = log.clone();
         let d = Daemon::with_bus(Some("unix:path=/nonexistent/kalango-cast-test-bus".into()))
             .with_handler_secret(SECRET.into())
-            // (development mode skips only the executable check; the secret is still required)
-            .with_dev_handler(true)
             .with_hook(Box::new(move |e| l2.lock().unwrap().push(e.clone())));
         (d, log)
     }
@@ -1544,10 +1489,10 @@ mod tests {
     }
 
     #[test]
-    fn a_daemon_the_app_did_not_spawn_takes_no_handler_unless_the_peers_executable_is_trusted() {
+    fn a_daemon_without_a_secret_has_no_handler_whatever_the_peer_presents_or_runs() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let l2 = log.clone();
-        // no secret, no dev mode, and the test binary (in the user's own build folder) is not a trusted install
+        // started by systemd or by hand: nobody gave it a secret, so nobody can be its handler
         let d = Daemon::with_bus(Some("unix:path=/nonexistent/kalango-cast-test-bus".into()))
             .with_hook(Box::new(move |e| l2.lock().unwrap().push(e.clone())));
         let (c, _c_in) = conn(1, my_uid());
@@ -1556,71 +1501,46 @@ mod tests {
         let dir = scratch("unspawned");
         assert_eq!(start(&d, &start_params(&dir.join("a.mp4")))["error"]["code"], CONSENT_REQUIRED);
         assert_eq!(log.lock().unwrap().len(), 1, "the terminal notice stands");
-        // a peer without a known pid is refused too
-        let nopid = ConnCtx { pid: None, ..conn(2, my_uid()).0 };
-        assert_eq!(reg(&d, &nopid, None)["error"]["code"], NOT_HANDLER);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn the_executable_check_uses_the_real_executable_of_the_pid() {
-        let sleep = ["/usr/bin/sleep", "/bin/sleep"].into_iter().map(PathBuf::from).find(|p| p.exists()).expect("sleep");
-        let mut child = std::process::Command::new(&sleep).arg("30").spawn().unwrap();
-        let pid = child.id();
-        // a root-owned program under /usr, named as trusted: accepted (the symlinked /bin is resolved)
-        let r = verify_exe(pid, &[PathBuf::from("/usr/bin/sleep")]);
-        assert!(r.is_ok(), "{r:?} (sleep is {})", sleep.display());
-        // another trusted program: refused
-        assert!(verify_exe(pid, &[PathBuf::from("/usr/bin/true")]).is_err());
-        assert!(verify_exe(pid, &[]).is_err());
-        let _ = child.kill();
-        let _ = child.wait();
-        // a process that is gone cannot be verified
-        assert!(verify_exe(pid, &[PathBuf::from("/usr/bin/sleep")]).is_err());
-        // this test binary lives in the user's own folders: never trusted, even when it names itself
-        let me = std::env::current_exe().unwrap();
-        let e = verify_exe(std::process::id(), &[me]).unwrap_err();
-        assert!(!e.is_empty());
+    fn the_daemon_says_ready_first_and_the_secret_is_read_after_it() {
+        use std::os::fd::IntoRawFd;
+        let (daemon_end, app_end) = UnixStream::pair().unwrap();
+        let fd = daemon_end.into_raw_fd();
+        let t = std::thread::spawn(move || receive_secret(fd, Duration::from_secs(5)));
+        let mut app_end = app_end;
+        app_end.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // the app waits for the ready byte; only then does the secret exist on the wire
+        let mut b = [0u8; 1];
+        app_end.read_exact(&mut b).unwrap();
+        assert_eq!(b[0], READY);
+        app_end.write_all(SECRET.as_bytes()).unwrap();
+        app_end.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(t.join().unwrap().unwrap(), SECRET);
     }
 
     #[test]
-    fn a_deleted_or_user_writable_executable_is_not_trusted() {
-        let dir = scratch("deleted");
-        let sleep = ["/usr/bin/sleep", "/bin/sleep"].into_iter().map(PathBuf::from).find(|p| p.exists()).unwrap();
-        let copy = dir.join("prog");
-        std::fs::copy(&sleep, &copy).unwrap();
-        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut child = std::process::Command::new(&copy).arg("30").spawn().unwrap();
-        // user-owned file in a user folder: refused although it names itself
-        assert!(verify_exe(child.id(), std::slice::from_ref(&copy)).is_err());
-        std::fs::remove_file(&copy).unwrap();
-        let e = verify_exe(child.id(), &[copy]).unwrap_err();
-        assert!(e.contains("deleted"), "{e}");
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_secret_is_read_from_a_pipe_and_compared_in_constant_time_shape() {
-        let mut fds = [0i32; 2];
-        // SAFETY: pipe2 fills the two descriptors we pass.
-        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        // SAFETY: fds[1] is the write end we just created and own.
-        let mut w = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]) };
-        writeln!(w, "{SECRET}").unwrap();
-        drop(w);
-        assert_eq!(read_secret_from_fd(fds[0]).unwrap(), SECRET);
-        // a short or empty secret is refused
-        let (r, w) = {
-            let mut p = [0i32; 2];
-            // SAFETY: as above.
-            assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-            (p[0], p[1])
-        };
-        // SAFETY: w is the write end we own.
-        drop(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(w) });
-        assert!(read_secret_from_fd(r).is_err());
+    fn a_missing_short_or_endless_secret_is_an_error_and_the_wait_is_bounded() {
+        use std::os::fd::IntoRawFd;
+        // the app never answers: the daemon gives up
+        let (d, _app) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        assert!(receive_secret(d.into_raw_fd(), Duration::from_millis(200)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(3));
+        // too short
+        let (d, mut app) = UnixStream::pair().unwrap();
+        app.write_all(b"short").unwrap();
+        drop(app);
+        assert!(receive_secret(d.into_raw_fd(), Duration::from_secs(1)).is_err());
+        // too long (never ends)
+        let (d, mut app) = UnixStream::pair().unwrap();
+        app.write_all(&[b'a'; 300]).unwrap();
+        assert!(receive_secret(d.into_raw_fd(), Duration::from_secs(1)).is_err());
+        let mut buf = *b"secret!!";
+        zeroize(&mut buf);
+        assert_eq!(buf, [0u8; 8]);
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
@@ -1644,7 +1564,7 @@ mod tests {
         let dir = scratch("request-id");
         let (d, _log) = daemon(Consent::Ask);
         let (ui, mut ui_in) = conn(1, my_uid());
-        call_from(&d, &ui, "consent.handler.register", json!({}));
+        call_from(&d, &ui, "consent.handler.register", json!({"secret": SECRET}));
         let r = start(&d, &start_params(&dir.join("a.mp4")));
         let ev = next_event(&mut ui_in);
         assert_eq!(r["error"]["code"], CONSENT_REQUIRED);
@@ -1667,7 +1587,7 @@ mod tests {
         let dir = scratch("superseded");
         let (d, log) = daemon(Consent::Ask);
         let (ui, mut ui_in) = conn(1, my_uid());
-        call_from(&d, &ui, "consent.handler.register", json!({}));
+        call_from(&d, &ui, "consent.handler.register", json!({"secret": SECRET}));
         start(&d, &start_params(&dir.join("a.mp4")));
         let first = next_event(&mut ui_in);
         let r = start(&d, &start_params(&dir.join("b.mp4")));

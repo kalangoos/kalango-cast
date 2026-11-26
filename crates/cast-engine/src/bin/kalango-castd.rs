@@ -2,8 +2,9 @@
 //!
 //! `kalango-castd [--socket PATH] [--bus DBUS_ADDRESS] [--secret-fd N]`
 //!
-//! `--secret-fd N`: the app that spawned us left a random secret in the inherited pipe N; a consent handler must present
-//! it to register. Without it, only a handler running from a trusted install is accepted, unless `KALANGO_CAST_DEV=1`.
+//! `--secret-fd N`: the app that spawned us keeps the other end of the socketpair N. We make ourselves undumpable first,
+//! say "ready" on it, and only then does the app send a random secret; a consent handler must present it to register.
+//! Without `--secret-fd` there is no consent handler at all: consent stays on this terminal (or the journal).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +26,10 @@ fn block_signals() -> libc::sigset_t {
 }
 
 fn main() {
+    // the very first thing, before arguments or any secret: other programs of the same user must not be able to read
+    // our memory or environment through /proc or ptrace
+    // SAFETY: prctl with PR_SET_DUMPABLE and a plain integer argument.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     let mut socket = rpc::default_socket();
     let mut bus = None;
     let mut secret_fd: Option<i32> = None;
@@ -48,20 +53,13 @@ fn main() {
         eprintln!("{}", tr("XDG_RUNTIME_DIR is not set: pass --socket"));
         std::process::exit(1);
     };
-    // other programs of the same user must not be able to read our memory or environment through /proc or ptrace
-    // SAFETY: prctl with PR_SET_DUMPABLE and a plain integer argument.
-    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-    let secret = secret_fd.map(|fd| match rpc::read_secret_from_fd(fd) {
+    let secret = secret_fd.map(|fd| match rpc::receive_secret(fd, std::time::Duration::from_secs(10)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("kalango-castd: --secret-fd {fd}: {e}");
             std::process::exit(2);
         }
     });
-    let dev = std::env::var_os("KALANGO_CAST_DEV").is_some_and(|v| v == "1");
-    if dev {
-        eprintln!("kalango-castd: KALANGO_CAST_DEV=1 {}", tr("DEVELOPMENT MODE: the consent handler's executable is not checked"));
-    }
     let set = block_signals();
     let listener = match rpc::bind(&socket) {
         Ok(l) => l,
@@ -90,7 +88,7 @@ fn main() {
             eprintln!("kalango-castd: {}", trf("RECORDING FAILED: {path}: {error}", &[("path", path.clone()), ("error", error.clone())]))
         }
     });
-    let mut daemon = Daemon::with_bus(bus).with_consent(rpc::load_consent()).with_dev_handler(dev).with_hook(hook);
+    let mut daemon = Daemon::with_bus(bus).with_consent(rpc::load_consent()).with_hook(hook);
     if let Some(s) = secret {
         daemon = daemon.with_handler_secret(s);
     }

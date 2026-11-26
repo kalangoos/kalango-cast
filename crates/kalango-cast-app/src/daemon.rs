@@ -40,7 +40,7 @@ pub fn find_binary() -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|d| d.join("kalango-castd")).find(|p| is_exe(p)))
 }
 
-/// The descriptor number the daemon finds its secret pipe on.
+/// The descriptor number the daemon finds its end of the secret socketpair on.
 const SECRET_FD: i32 = 3;
 
 /// A random secret (256 bits, hex) from the kernel.
@@ -51,34 +51,34 @@ fn new_secret() -> std::io::Result<String> {
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
-/// Starts `cmd` with a fresh secret in an inherited pipe: the child finds it on descriptor 3 (`--secret-fd 3` is added
-/// to its arguments). The secret is in neither the environment, nor the arguments, nor any file; the parent keeps it
-/// in memory only and closes its end of the pipe. Returns the child and the secret.
-pub fn spawn_with_secret(cmd: &mut Command) -> std::io::Result<(Child, String)> {
-    use std::io::Write;
+/// The byte the daemon sends on the socketpair when it is undumpable and ready for the secret (`cast_engine::rpc::READY`).
+const READY: u8 = b'R';
+
+/// How long the app waits for the daemon's ready byte before it gives up on the secret.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Starts `cmd` and hands it a secret over a **socketpair** the parent keeps: the child finds its end on descriptor 3
+/// (`--secret-fd 3` is added to its arguments). The handshake: the child makes itself undumpable first and writes one
+/// READY byte; **only after reading it** does the parent generate the secret and send it (so nothing secret exists
+/// before the daemon is protected), then closes its writing side. If the byte does not come within `ready_timeout`
+/// (a stand-in or a daemon that is not ours), no secret is ever created or sent and the result is `None`: the
+/// consent then stays on the daemon's terminal. The secret is in neither the environment, the arguments, nor any file;
+/// the parent keeps it in memory only.
+pub fn spawn_with_secret(cmd: &mut Command, ready_timeout: Duration) -> std::io::Result<(Child, Option<String>)> {
+    use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
-    let secret = new_secret()?;
-    let mut fds = [0i32; 2];
-    // SAFETY: pipe2 fills the two descriptors we pass.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: both descriptors are fresh and ours; OwnedFd closes them.
-    let (read_end, write_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    // a small secret fits the pipe's buffer: written now, so the daemon can read it whenever it starts
-    let mut w = std::fs::File::from(write_end);
-    w.write_all(secret.as_bytes())?;
-    drop(w);
-    // keep the read end clear of descriptor 3 so the dup2 below always clears close-on-exec
+    let (mut parent, child_end) = UnixStream::pair()?;
+    // keep the child's end clear of descriptor 3 so the dup2 below always clears close-on-exec
     // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor >= 10 for the one we own.
-    let high = unsafe { libc::fcntl(read_end.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    let high = unsafe { libc::fcntl(child_end.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
     if high < 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `high` is a fresh descriptor we own.
     let high = unsafe { OwnedFd::from_raw_fd(high) };
-    drop(read_end);
+    drop(child_end);
     cmd.arg("--secret-fd").arg(SECRET_FD.to_string());
     let src = high.as_raw_fd();
     // SAFETY: the closure runs between fork and exec and only calls dup2, which is async-signal-safe; dup2 gives the
@@ -93,13 +93,25 @@ pub fn spawn_with_secret(cmd: &mut Command) -> std::io::Result<(Child, String)> 
     }
     let child = cmd.spawn()?;
     drop(high);
-    Ok((child, secret))
+    parent.set_read_timeout(Some(ready_timeout))?;
+    parent.set_write_timeout(Some(ready_timeout))?;
+    let mut byte = [0u8; 1];
+    let ready = parent.read_exact(&mut byte).is_ok() && byte[0] == READY;
+    if !ready {
+        // never ready: no secret exists, none is sent, and our end closes
+        return Ok((child, None));
+    }
+    let secret = new_secret()?;
+    parent.write_all(secret.as_bytes())?;
+    parent.shutdown(std::net::Shutdown::Write)?;
+    Ok((child, Some(secret)))
 }
 
 /// The service as the app sees it; dropping it stops the daemon if the app started it.
 pub struct Service {
     child: Option<Child>,
-    /// The consent-handler secret of the daemon we spawned (memory only; never logged or written).
+    /// The consent-handler secret of the daemon we spawned, if it said it was ready (memory only; never logged or
+    /// written). None: no handler, consent stays on the daemon's terminal.
     secret: Option<String>,
 }
 
@@ -127,11 +139,11 @@ impl Service {
             Some(f) => cmd.stderr(Stdio::from(f)),
             None => cmd.stderr(Stdio::null()),
         };
-        let (mut child, secret) = spawn_with_secret(&mut cmd).map_err(|e| format!("{}: {e}", binary.display()))?;
+        let (mut child, secret) = spawn_with_secret(&mut cmd, READY_TIMEOUT).map_err(|e| format!("{}: {e}", binary.display()))?;
         let end = Instant::now() + START_TIMEOUT;
         loop {
             if is_running(socket) {
-                return Ok(Service { child: Some(child), secret: Some(secret) });
+                return Ok(Service { child: Some(child), secret });
             }
             if let Ok(Some(status)) = child.try_wait() {
                 let how = match (status.code(), status.signal()) {
@@ -239,21 +251,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn the_secret_reaches_the_child_on_fd_3_and_is_nowhere_else() {
-        let dir = scratch("secret-fd");
-        let out = dir.join("seen");
-        // a stand-in child: copies what it finds on descriptor 3 to a file, then waits so /proc can be read
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("cat <&3 > \"$0\"; sleep 30").arg(&out);
-        let (mut child, secret) = spawn_with_secret(&mut cmd).unwrap();
-        let end = Instant::now() + Duration::from_secs(5);
-        while std::fs::read_to_string(&out).map(|s| s.is_empty()).unwrap_or(true) {
-            assert!(Instant::now() < end, "the child never read the secret");
+    /// A stand-in daemon in bash: reads fd 3 before saying ready (to see whether anything was written early), says ready
+    /// (or not), reads the secret, then waits so /proc can be inspected.
+    fn stand_in(dir: &std::path::Path, say_ready: bool) -> Command {
+        let script = if say_ready {
+            r#"read -t 0.4 -n 64 early <&3; echo -n "${#early}" > "$0.early"; printf R >&3; read -n 64 got <&3; echo -n "$got" > "$0"; sleep 30; :"#
+        } else {
+            // never ready: tries to read the secret anyway, after the app has given up
+            r#"sleep 1; read -t 1 -n 64 got <&3; echo -n "${got}" > "$0"; echo -n done > "$0.end"; sleep 30"#
+        };
+        let mut cmd = Command::new("/bin/bash");
+        cmd.arg("-c").arg(script).arg(dir.join("seen"));
+        cmd
+    }
+
+    fn wait_for(path: &std::path::Path) -> String {
+        let end = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if !s.is_empty() || path.to_string_lossy().ends_with("seen") {
+                    return s;
+                }
+            }
+            assert!(Instant::now() < end, "{} never appeared", path.display());
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(std::fs::read_to_string(&out).unwrap(), secret);
+    }
+
+    #[test]
+    fn the_secret_is_sent_only_after_ready_and_is_nowhere_else() {
+        let dir = scratch("handshake");
+        let (mut child, secret) = spawn_with_secret(&mut stand_in(&dir, true), Duration::from_secs(5)).unwrap();
+        let secret = secret.expect("the daemon said ready");
         assert_eq!(secret.len(), 64);
+        // nothing had been written to the daemon's end before it said ready
+        assert_eq!(wait_for(&dir.join("seen.early")), "0");
+        let end = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(dir.join("seen")).map(|s| s.is_empty()).unwrap_or(true) {
+            assert!(Instant::now() < end, "the daemon never got the secret");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("seen")).unwrap(), secret);
         let pid = child.id();
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
         let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
@@ -261,10 +299,36 @@ mod tests {
         assert!(!has(&cmdline), "not in the arguments");
         assert!(!has(&environ), "not in the environment");
         assert!(String::from_utf8_lossy(&cmdline).contains("--secret-fd"));
-        // and two spawns never share a secret
-        let (mut c2, s2) = spawn_with_secret(Command::new("/bin/sleep").arg("30")).unwrap();
-        assert_ne!(secret, s2);
+        let (mut c2, s2) = spawn_with_secret(Command::new("/bin/sleep").arg("30"), Duration::from_millis(100)).unwrap();
+        assert!(s2.is_none());
         let _ = (child.kill(), child.wait(), c2.kill(), c2.wait());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_daemon_that_never_says_ready_gets_no_secret_and_the_app_times_out() {
+        let dir = scratch("never-ready");
+        let start = Instant::now();
+        let (mut child, secret) = spawn_with_secret(&mut stand_in(&dir, false), Duration::from_millis(300)).unwrap();
+        assert!(secret.is_none(), "no secret is created for a daemon that is not ready");
+        assert!(start.elapsed() < Duration::from_secs(3), "the wait is bounded");
+        // the stand-in reads later: it finds nothing (our end is closed), so it never sees a secret
+        wait_for(&dir.join("seen.end"));
+        assert_eq!(std::fs::read_to_string(dir.join("seen")).unwrap_or_default().trim(), "");
+        let _ = (child.kill(), child.wait());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_service_without_a_secret_is_a_service_without_a_handler() {
+        // the app would register without a secret, and the daemon refuses it: consent stays on the terminal
+        let dir = scratch("no-secret");
+        let sock = dir.join("kalango").join("cast.sock");
+        let listener = rpc::bind(&sock).unwrap();
+        let d = Arc::new(Daemon::default());
+        std::thread::spawn(move || d.serve(listener));
+        let s = Service::ensure_running(&sock, None).unwrap();
+        assert!(s.secret().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

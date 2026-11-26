@@ -185,6 +185,8 @@ mod tests {
     use cast_engine::rpc::{self, Consent, Daemon};
     use std::sync::Arc;
 
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
     fn serve(name: &str, hook_log: Arc<Mutex<Vec<String>>>) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!("kalango-cast-app-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -193,7 +195,7 @@ mod tests {
         let d = Arc::new(
             Daemon::with_bus(Some("unix:path=/nonexistent/kalango-cast-app-bus".into()))
                 .with_consent(Consent::Ask)
-                .with_dev_handler(true)
+                .with_handler_secret(SECRET.into())
                 .with_hook(Box::new(move |e| hook_log.lock().unwrap().push(format!("{e:?}")))),
         );
         std::thread::spawn(move || d.serve(listener));
@@ -250,7 +252,7 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let (dir, sock) = serve("consent", log.clone());
         let (tx, rx) = async_channel::unbounded();
-        let link = spawn_events(sock.clone(), tx, Arc::new(Mutex::new(None)));
+        let link = spawn_events(sock.clone(), tx, Arc::new(Mutex::new(Some(SECRET.to_string()))));
         let next = || {
             let end = Instant::now() + Duration::from_secs(5);
             loop {
@@ -286,7 +288,7 @@ mod tests {
         let listener = rpc::bind(&sock).unwrap();
         let d = Arc::new(
             Daemon::with_bus(Some("unix:path=/nonexistent/kalango-cast-app-bus".into()))
-                .with_dev_handler(true)
+                .with_handler_secret(SECRET.into())
                 .with_handler_secret("s3cret-s3cret-s3cret-s3cret".into()),
         );
         std::thread::spawn(move || d.serve(listener));
@@ -312,7 +314,7 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let (dir, sock) = serve("deny", log);
         let (tx, rx) = async_channel::unbounded();
-        let link = spawn_events(sock.clone(), tx, Arc::new(Mutex::new(None)));
+        let link = spawn_events(sock.clone(), tx, Arc::new(Mutex::new(Some(SECRET.to_string()))));
         assert!(matches!(rx.recv_blocking().unwrap(), Msg::HandlerRegistered));
         let params = start_params(&dir);
         let _ = call(&sock, "record.start", params.clone(), Duration::from_secs(5));

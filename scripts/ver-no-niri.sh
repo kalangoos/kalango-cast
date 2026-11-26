@@ -49,15 +49,13 @@ cp "$repo/assets/logo-kalango-cast.png" "$share/icons/hicolor/512x512/apps/os.ka
 
 # 6. o daemon: quem o inicia é o app (processo filho, com um segredo por pipe herdado, que só ele conhece), já com o
 #    barramento do niri aninhado no ambiente. Se já houver um daemon respondendo, o app usa esse (e, sem o segredo,
-#    ele só aceita a janela como tratador do consentimento se foi iniciado com KALANGO_CAST_DEV=1).
+#    ele não tem segredo e, então, não tem tratador: o consentimento fica no terminal dele).
 sock=$runtime/kalango/cast.sock
 if [ -S "$sock" ] && "$target/debug/kalango-cast" rpc capabilities '{}' >/dev/null 2>&1; then
     echo "ver-no-niri: já há um kalango-castd em $sock: o app vai usar esse (não o criei, não vou encerrá-lo)"
 fi
 
 # 7. o app, no compositor aninhado (sem DISPLAY: nada de cair no X11 do computador)
-# KALANGO_CAST_DEV=1: o binário de desenvolvimento não é uma instalação do root, então a conferência do executável
-# do tratador de consentimento é pulada (o segredo continua valendo); o daemon avisa isso no log.
-env -u DISPLAY WAYLAND_DISPLAY="$display" GDK_BACKEND=wayland DBUS_SESSION_BUS_ADDRESS="$dbus" KALANGO_CAST_DEV=1 \
+env -u DISPLAY WAYLAND_DISPLAY="$display" GDK_BACKEND=wayland DBUS_SESSION_BUS_ADDRESS="$dbus" \
     XDG_DATA_DIRS="$share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}" KALANGO_CASTD="$castd" \
     "$app"
