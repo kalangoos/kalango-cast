@@ -14,5 +14,7 @@
   "usage: kalango-cast record|sources|caps|inspect|openh264|rpc …  (see the source's header or the README)": "uso: kalango-cast record|sources|caps|inspect|openh264|rpc …  (veja o cabeçalho do código ou o README)",
   "zero-copy": "zero-cópia",
   "{t} s · {fps} fps · {frames} frames · {dropped} dropped · encode {enc} ms · latency {lat} ms · {kbps} kbit/s · CPU {cpu} %": "{t} s · {fps} qps · {frames} quadros · {dropped} perdidos · codificação {enc} ms · latência {lat} ms · {kbps} kbit/s · CPU {cpu} %",
-  "Approved: the held recording may start now (ask the program to try again)": "Aprovado: a gravação pedida já pode começar (peça ao programa para tentar de novo)"
+  "Approved: the held recording may start now (ask the program to try again)": "Aprovado: a gravação pedida já pode começar (peça ao programa para tentar de novo)",
+  "DEVELOPMENT MODE: the consent handler's executable is not checked": "MODO DE DESENVOLVIMENTO: o executável de quem trata o consentimento não é conferido",
+  "The held recording request was replaced by a different one; its code no longer works": "O pedido de gravação em espera foi trocado por outro; o código dele não vale mais"
 }

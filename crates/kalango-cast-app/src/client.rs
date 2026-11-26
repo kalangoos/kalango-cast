@@ -19,7 +19,7 @@ pub enum CallError {
     /// The socket could not be reached or did not answer in time (the service is not there).
     Transport(String),
     /// The service answered with a JSON-RPC error.
-    Rpc { code: i64, message: String },
+    Rpc { code: i64, message: String, request_id: Option<String> },
 }
 
 impl CallError {
@@ -56,7 +56,11 @@ pub fn call(socket: &Path, method: &str, params: Value, timeout: Duration) -> Re
 pub fn parse_reply(line: &str) -> Result<Value, CallError> {
     let v: Value = serde_json::from_str(line).map_err(|e| CallError::Transport(format!("invalid reply: {e}")))?;
     if let Some(err) = v.get("error") {
-        return Err(CallError::Rpc { code: err["code"].as_i64().unwrap_or(-32000), message: err["message"].as_str().unwrap_or("error").to_string() });
+        return Err(CallError::Rpc {
+            code: err["code"].as_i64().unwrap_or(-32000),
+            message: err["message"].as_str().unwrap_or("error").to_string(),
+            request_id: err["data"]["request_id"].as_str().map(str::to_string),
+        });
     }
     Ok(v.get("result").cloned().unwrap_or(Value::Null))
 }
@@ -68,7 +72,9 @@ pub fn event_to_msg(line: &str, now: Instant) -> Option<Msg> {
     if v["method"] == "event" {
         let p = &v["params"];
         return match p["type"].as_str()? {
+            "consent_superseded" => Some(Msg::ConsentSuperseded { request_id: p["request_id"].as_str()?.to_string() }),
             "consent_requested" => Some(Msg::ConsentRequested(ConsentRequest {
+                request_id: p["request_id"].as_str()?.to_string(),
                 what: p["what"].as_str()?.to_string(),
                 token: p["token"].as_str()?.to_string(),
                 received: now,
@@ -123,14 +129,20 @@ impl EventLink {
 
 /// Starts the event connection thread: connects, registers as the consent handler, forwards what the daemon pushes;
 /// reconnects (every 2 s) when the connection drops. Messages go to `tx` (the main loop).
-pub fn spawn_events(socket: PathBuf, tx: Sender<Msg>) -> EventLink {
+pub fn spawn_events(socket: PathBuf, tx: Sender<Msg>, secret: Arc<Mutex<Option<String>>>) -> EventLink {
     let link = EventLink { out: Arc::new(Mutex::new(None)) };
     let shared = link.out.clone();
     let _ = std::thread::Builder::new().name("cast-events".into()).spawn(move || loop {
         match UnixStream::connect(&socket) {
             Ok(s) => {
                 let Ok(mut w) = s.try_clone() else { continue };
-                let registered = writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": REGISTER_ID, "method": "consent.handler.register"})).is_ok();
+                // the secret of the daemon this app spawned (memory only); none for a daemon someone else started
+                let params = match secret.lock().ok().and_then(|s| s.clone()) {
+                    Some(s) => json!({"secret": s}),
+                    None => json!({}),
+                };
+                let registered =
+                    writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": REGISTER_ID, "method": "consent.handler.register", "params": params})).is_ok();
                 if let Ok(mut slot) = shared.lock() {
                     *slot = Some(w);
                 }
@@ -138,8 +150,13 @@ pub fn spawn_events(socket: PathBuf, tx: Sender<Msg>) -> EventLink {
                     for line in BufReader::new(s).lines() {
                         let Ok(line) = line else { break };
                         if let Some(m) = event_to_msg(&line, Instant::now()) {
+                            // a refused registration ends this connection (it is retried, with the secret if it came late)
+                            let refused = matches!(m, Msg::HandlerUnavailable(_));
                             if tx.send_blocking(m).is_err() {
                                 return;
+                            }
+                            if refused {
+                                break;
                             }
                         }
                     }
@@ -157,7 +174,7 @@ pub fn spawn_events(socket: PathBuf, tx: Sender<Msg>) -> EventLink {
                 }
             }
         }
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(700));
     });
     link
 }
@@ -176,6 +193,7 @@ mod tests {
         let d = Arc::new(
             Daemon::with_bus(Some("unix:path=/nonexistent/kalango-cast-app-bus".into()))
                 .with_consent(Consent::Ask)
+                .with_dev_handler(true)
                 .with_hook(Box::new(move |e| hook_log.lock().unwrap().push(format!("{e:?}")))),
         );
         std::thread::spawn(move || d.serve(listener));
@@ -190,8 +208,8 @@ mod tests {
     fn replies_are_split_into_results_and_errors() {
         assert_eq!(parse_reply(r#"{"jsonrpc":"2.0","id":1,"result":{"a":1}}"#).unwrap()["a"], 1);
         assert_eq!(
-            parse_reply(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"consent_required"}}"#),
-            Err(CallError::Rpc { code: -32001, message: "consent_required".into() })
+            parse_reply(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"consent_required","data":{"request_id":"abc123"}}}"#),
+            Err(CallError::Rpc { code: -32001, message: "consent_required".into(), request_id: Some("abc123".into()) })
         );
         assert!(matches!(parse_reply("not json"), Err(CallError::Transport(_))));
     }
@@ -199,7 +217,7 @@ mod tests {
     #[test]
     fn pushed_lines_become_model_messages() {
         let now = Instant::now();
-        let line = r#"{"jsonrpc":"2.0","method":"event","params":{"type":"consent_requested","what":"source: x","token":"abc","ttl_s":90}}"#;
+        let line = r#"{"jsonrpc":"2.0","method":"event","params":{"type":"consent_requested","request_id":"rid","what":"source: x","token":"abc","ttl_s":90}}"#;
         match event_to_msg(line, now) {
             Some(Msg::ConsentRequested(r)) => assert_eq!((r.what.as_str(), r.token.as_str(), r.ttl), ("source: x", "abc", Duration::from_secs(90))),
             other => panic!("{other:?}"),
@@ -232,7 +250,7 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let (dir, sock) = serve("consent", log.clone());
         let (tx, rx) = async_channel::unbounded();
-        let link = spawn_events(sock.clone(), tx);
+        let link = spawn_events(sock.clone(), tx, Arc::new(Mutex::new(None)));
         let next = || {
             let end = Instant::now() + Duration::from_secs(5);
             loop {
@@ -261,11 +279,40 @@ mod tests {
     }
 
     #[test]
+    fn a_daemon_with_a_secret_only_accepts_the_app_that_holds_it() {
+        let dir = std::env::temp_dir().join(format!("kalango-cast-app-{}-secret", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sock = dir.join("kalango").join("cast.sock");
+        let listener = rpc::bind(&sock).unwrap();
+        let d = Arc::new(
+            Daemon::with_bus(Some("unix:path=/nonexistent/kalango-cast-app-bus".into()))
+                .with_dev_handler(true)
+                .with_handler_secret("s3cret-s3cret-s3cret-s3cret".into()),
+        );
+        std::thread::spawn(move || d.serve(listener));
+        // an app without the secret (a rogue, or one that started before the daemon's secret was known) is refused
+        let (tx, rx) = async_channel::unbounded();
+        let slot = Arc::new(Mutex::new(None));
+        let _link = spawn_events(sock.clone(), tx, slot.clone());
+        assert!(matches!(rx.recv_blocking().unwrap(), Msg::HandlerUnavailable(_)));
+        // the secret arrives: the retry registers
+        *slot.lock().unwrap() = Some("s3cret-s3cret-s3cret-s3cret".into());
+        loop {
+            match rx.recv_blocking().unwrap() {
+                Msg::HandlerRegistered => break,
+                Msg::HandlerUnavailable(_) => continue,
+                other => panic!("{other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn denying_goes_out_on_the_registered_connection() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let (dir, sock) = serve("deny", log);
         let (tx, rx) = async_channel::unbounded();
-        let link = spawn_events(sock.clone(), tx);
+        let link = spawn_events(sock.clone(), tx, Arc::new(Mutex::new(None)));
         assert!(matches!(rx.recv_blocking().unwrap(), Msg::HandlerRegistered));
         let params = start_params(&dir);
         let _ = call(&sock, "record.start", params.clone(), Duration::from_secs(5));

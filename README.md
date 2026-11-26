@@ -31,7 +31,7 @@ O código compila e passa no `clippy -D warnings` e nos testes de unidade. Pouco
 | VA-API (AMD, Intel), OpenH264 | só a detecção do VA-API existe; o OpenH264 não foi rodado (o download conferido tem teste `#[ignore]`, `KALANGO_CAST_OPENH264_NET=1`) |
 
 | **Janela `kalango-cast-app`** (GTK4) | **abre e funciona numa sessão niri aninhada do KalangoOS** (capturas em [`docs/capturas/`](docs/capturas/)); **sem captura**: o niri aninhado em que foi aberta não oferece o ScreenCast (`org.gnome.Mutter.DisplayConfig` ausente no barramento dele), então a janela mostrou, de verdade, "A captura não está disponível nesta sessão" e o botão Gravar ficou desligado. **Nenhuma gravação foi feita pela janela**, nem com o niri com o patch de `tests/niri/` |
-| Consentimento pela janela | testado com o código do serviço de verdade (testes de unidade e de integração: o código chega só à janela, outro cliente não aprova, negar derruba o pedido); na sessão aninhada o diálogo apareceu para um pedido feito por `kalango-cast rpc record.start`, mas **ninguém clicou Permitir/Negar nessa sessão** (sem ferramenta de clique) |
+| Consentimento pela janela | testado com o código do serviço de verdade (testes de unidade e de integração: o código chega só à janela autenticada, um cliente falso que se registra antes não recebe nada e não aprova, segredo errado, o segredo não está no `cmdline`/`environ` do filho, pedido de outro programa rotulado como tal, pedido trocado vira `consent_superseded`, negar derruba o pedido; a conferência do executável foi testada com processos de verdade, mas **nunca com uma instalação em `/usr` ou `/opt`**: o binário de desenvolvimento roda com `KALANGO_CAST_DEV=1`); na sessão aninhada o diálogo apareceu para um pedido feito por `kalango-cast rpc record.start`, mas **ninguém clicou Permitir/Negar nessa sessão** (sem ferramenta de clique) |
 
 Testes que dependem de máquina, rede ou compositor são `#[ignore]` e dizem a variável de ambiente que os liga:
 `KALANGO_CAST_GPU` (NVENC), `KALANGO_CAST_OPENH264_NET` (download), `KALANGO_CAST_NIRI` (sessão completa) e `KALANGO_CASTD` (a janela iniciando o `kalango-castd` de verdade como processo filho).
@@ -65,15 +65,36 @@ A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, 
   (válido 120 s, cancelado após 5 erros, só para aquele pedido) aparece **apenas** no terminal do `kalango-castd`
   (o `Hook` do daemon), e a pessoa roda `kalango-cast approve CÓDIGO`; o mesmo `record.start` passa uma vez. O
   `kalango-cast record` na linha de comando é a própria pessoa pedindo e não passa por isso.
-- **Consentimento pela janela (feito)**: a `kalango-cast-app` se registra como **quem trata o consentimento**
-  (`consent.handler.register`, com a checagem do uid de quem conecta). Enquanto ela está registrada, o código e a
-  descrição do pedido (a origem, o som, o microfone, a pasta e o arquivo, escapados pelo motor) vão **só para ela**,
-  como notificações JSON-RPC (`method` "event"); **não são mais impressos no terminal**, e só a conexão registrada
-  aprova (`consent.approve`) ou nega (`consent.deny`); outro cliente, mesmo com o código, recebe -32003. A janela
-  mostra o diálogo "Permitir gravar a tela/microfone?" também para pedidos de **outros programas** (um agente, um
-  script), porque ninguém mais consegue responder. Sem janela registrada (ou se ela morrer ou travar) vale o terminal,
-  exatamente como antes (`kalango-cast approve CÓDIGO`). Um só tratador por vez; um programa hostil da mesma pessoa
-  que se registrasse antes da janela receberia os códigos (é a mesma confiança que o terminal já exigia).
+- **Consentimento pela janela (feito, com autenticação)**: a `kalango-cast-app` se registra como **quem trata o
+  consentimento** (`consent.handler.register`). Enquanto ela está registrada, o código e a descrição do pedido (a
+  origem, o som, o microfone, a pasta e o arquivo, escapados pelo motor) vão **só para ela**, como notificações
+  JSON-RPC (`method` "event"); **não são mais impressos no terminal**, e só a conexão registrada aprova
+  (`consent.approve`) ou nega (`consent.deny`); outro cliente, mesmo com o código, recebe -32003. **O registro é
+  autenticado, e nada (código, descrição, silêncio do terminal) é entregue antes disso:**
+  1. quando a janela inicia o `kalango-castd`, ela passa um **segredo aleatório de 256 bits por um pipe herdado**
+     (`--secret-fd 3`; não vai no ambiente, nem nos argumentos, nem em arquivo; a janela o guarda só na memória) e
+     o registro precisa apresentá-lo (comparação em tempo constante); segredo ausente ou errado: -32003;
+  2. conferência do **executável de quem conecta** (pidfd + `/proc/<pid>/exe`, dispositivo+inode, sem
+     "(deleted)"): precisa ser um **binário instalado** (`/usr/bin/kalango-cast-app`,
+     `/usr/libexec/kalango-cast/kalango-cast-app` ou `/opt/kalango-cast/bin/kalango-cast-app`), do root, em pastas
+     do root e sem escrita para o usuário. Um daemon que a janela **não** iniciou (systemd, o usuário) só aceita um
+     tratador por essa conferência; sem ela o consentimento continua no terminal/diário;
+  3. desenvolvimento: `KALANGO_CAST_DEV=1` (no ambiente do daemon) **pula só a conferência do executável** (o segredo
+     continua valendo) e o `kalango-castd` avisa em voz alta no terminal; o `scripts/ver-no-niri.sh` e o
+     `cargo run` precisam disso, porque o binário de desenvolvimento não é uma instalação do root.
+  Sem tratador autenticado vale o terminal, exatamente como antes (`kalango-cast approve CÓDIGO`); o aviso do
+  terminal só é calado depois que a autenticação passa. Um só tratador por vez. O daemon e a janela fazem
+  `prctl(PR_SET_DUMPABLE, 0)` (o `/proc/<pid>/environ` e a memória deles ficam fechados para outros processos).
+  **Risco que resta:** um processo da mesma pessoa que consiga **ptrace/injetar código na janela ou ler a memória
+  dela** (por exemplo, com `ptrace_scope` frouxo e a janela rodando como o mesmo usuário, ou com root) ainda
+  vence: ele passa a ser a janela. Em modo `KALANGO_CAST_DEV=1`, num daemon sem segredo, qualquer processo da mesma
+  pessoa pode se registrar. A conferência por pid também tem a janela de corrida inerente de `SO_PEERCRED`
+  (mitigada com o pidfd).
+- **Cada pedido tem um nome (`request_id`)**: o erro `consent_required` de quem pediu traz o mesmo `request_id` do
+  evento enviado à janela; a janela só rotula um pedido como **seu** se o id for o que o `record.start` dela
+  recebeu, e mostra os outros como "Pedido de outro programa", com as linhas exatas do motor. Um pedido novo e
+  diferente que troca um pedido sem resposta **não é silencioso**: o tratador recebe `consent_superseded` (e o
+  terminal, se não há tratador).
 - **Indicador**: o daemon avisa início, fim e falha da gravação ao `Hook` (impresso no terminal do `kalango-castd`)
   e à janela registrada; a **janela tem um indicador sempre visível** (ponto vermelho e cronômetro no alto, fora de
   qualquer rolagem). **Não há indicador do sistema (ilha da barra) nem sinal D-Bus ainda.**

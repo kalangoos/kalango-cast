@@ -87,6 +87,8 @@ struct UiState {
     folder: PathBuf,
     last_config: Option<StartConfig>,
     dialog: Option<gtk::Window>,
+    /// The request the open dialog shows (a different one means a new dialog).
+    dialog_request: Option<String>,
     dialog_countdown: Option<gtk::Label>,
     dialog_buttons: Vec<gtk::Button>,
     /// A row selection made by the code (a list rebuild) must not count as the person's choice.
@@ -103,6 +105,7 @@ struct App {
     link: EventLink,
     socket: PathBuf,
     service: Arc<Mutex<Option<Service>>>,
+    secret: Arc<Mutex<Option<String>>>,
     sources_busy: Arc<AtomicBool>,
     status_busy: Arc<AtomicBool>,
 }
@@ -184,7 +187,8 @@ fn build(application: &gtk::Application) {
         application.quit();
         return;
     };
-    let link = client::spawn_events(socket.clone(), tx.clone());
+    let secret = Arc::new(Mutex::new(None));
+    let link = client::spawn_events(socket.clone(), tx.clone(), secret.clone());
     let w = build_widgets(application);
     let folder = default_folder();
     let app = Rc::new(App {
@@ -196,6 +200,7 @@ fn build(application: &gtk::Application) {
             folder,
             last_config: None,
             dialog: None,
+            dialog_request: None,
             dialog_countdown: None,
             dialog_buttons: Vec::new(),
             rebuilding: false,
@@ -211,6 +216,7 @@ fn build(application: &gtk::Application) {
         link,
         socket,
         service: Arc::new(Mutex::new(None)),
+        secret,
         sources_busy: Arc::new(AtomicBool::new(false)),
         status_busy: Arc::new(AtomicBool::new(false)),
     });
@@ -565,7 +571,7 @@ impl App {
     /// Starts (or finds) the daemon without blocking the window.
     fn start_service(self: &Rc<Self>) {
         self.dispatch_quiet_connecting();
-        let (tx, slot, socket) = (self.tx.clone(), self.service.clone(), self.socket.clone());
+        let (tx, slot, socket, secret) = (self.tx.clone(), self.service.clone(), self.socket.clone(), self.secret.clone());
         let _ = std::thread::Builder::new().name("cast-service".into()).spawn(move || {
             match Service::ensure_running(&socket, daemon::find_binary().as_deref()) {
                 Ok(svc) => {
@@ -573,6 +579,10 @@ impl App {
                         "kalango-cast-app: {}",
                         if svc.started_by_app() { "started kalango-castd (stopped when the app exits)" } else { "using the running kalango-castd" }
                     );
+                    // the handler secret is kept in memory only, ready before the first registration attempt
+                    if let Ok(mut s) = secret.lock() {
+                        *s = svc.secret().map(str::to_string);
+                    }
                     if let Ok(mut s) = slot.lock() {
                         *s = Some(svc);
                     }
@@ -613,7 +623,7 @@ impl App {
                 let _ = std::thread::Builder::new().name("cast-start".into()).spawn(move || {
                     let msg = match client::call(&socket, "record.start", cfg.to_params(), Duration::from_secs(40)) {
                         Ok(status) => Msg::Started { at: Instant::now(), status },
-                        Err(CallError::Rpc { code, message }) => Msg::StartFailed { code, message },
+                        Err(CallError::Rpc { code, message, request_id }) => Msg::StartFailed { code, message, request_id },
                         Err(CallError::Transport(m)) => {
                             let _ = tx.send_blocking(Msg::DaemonUnavailable(m.clone()));
                             return;
@@ -720,7 +730,7 @@ impl App {
             Err(why) => {
                 // shown as the error banner, like any failed start
                 let _ = self.model.borrow_mut().update(Msg::StartClicked);
-                self.dispatch(Msg::StartFailed { code: -32000, message: why });
+                self.dispatch(Msg::StartFailed { code: -32000, message: why, request_id: None });
             }
         }
     }
@@ -977,20 +987,24 @@ impl App {
     // ---- the consent dialog -----------------------------------------------------------------------------------
 
     fn render_dialog(self: &Rc<Self>) {
-        let want = self.model.borrow().consent_dialog().map(|(r, own)| (r.what.clone(), own));
-        let have = self.st.borrow().dialog.is_some();
-        match (want, have) {
-            (Some((what, own)), false) => self.open_dialog(&what, own),
-            (None, true) => {
-                if let Some(d) = self.st.borrow_mut().dialog.take() {
-                    d.destroy();
-                }
-                let mut st = self.st.borrow_mut();
-                st.dialog_countdown = None;
-                st.dialog_buttons.clear();
-                self.anim.borrow_mut().dialog_opacity.snap(0.0);
+        let want = self.model.borrow().consent_dialog().map(|(r, own)| (r.request_id.clone(), r.what.clone(), own));
+        let showing = self.st.borrow().dialog_request.clone();
+        // the dialog shows exactly one request: when it changes (answered, replaced, expired) the dialog does too
+        if showing.is_some() && showing != want.as_ref().map(|w| w.0.clone()) {
+            if let Some(d) = self.st.borrow_mut().dialog.take() {
+                d.destroy();
             }
-            _ => {}
+            let mut st = self.st.borrow_mut();
+            st.dialog_request = None;
+            st.dialog_countdown = None;
+            st.dialog_buttons.clear();
+            self.anim.borrow_mut().dialog_opacity.snap(0.0);
+        }
+        if let Some((id, what, own)) = want {
+            if self.st.borrow().dialog_request.is_none() {
+                self.st.borrow_mut().dialog_request = Some(id);
+                self.open_dialog(&what, own);
+            }
         }
     }
 
@@ -1009,6 +1023,10 @@ impl App {
         body.set_margin_start(20);
         body.set_margin_end(20);
         body.append(&label(tr("Allow recording the screen/microphone?"), &["card-title"]));
+        if !own {
+            // not ours: the person must not approve it believing this app asked
+            body.append(&label(tr("Request from another program"), &["card-title"]));
+        }
         let intro = if own {
             tr("Kalango Cast asks the recording service to do this. It describes it exactly like this:")
         } else {

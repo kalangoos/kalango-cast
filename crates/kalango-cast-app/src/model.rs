@@ -29,6 +29,9 @@ pub enum Phase {
 /// A request the daemon holds for the person's approval, as it described it (escaped by the engine).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsentRequest {
+    /// The request's public name: the daemon tells the client that made it the same id in its `consent_required`
+    /// error, which is how a request is known to be ours.
+    pub request_id: String,
     pub what: String,
     pub token: String,
     pub received: Instant,
@@ -252,9 +255,14 @@ pub enum Msg {
     StartFailed {
         code: i64,
         message: String,
+        request_id: Option<String>,
     },
     /// The daemon pushed a consent request to us, its registered handler.
     ConsentRequested(ConsentRequest),
+    /// The daemon replaced a held request with a different one before it was answered.
+    ConsentSuperseded {
+        request_id: String,
+    },
     /// We could not register as the consent handler (the code then goes to the daemon's terminal).
     HandlerUnavailable(String),
     /// We are the registered consent handler.
@@ -295,10 +303,16 @@ pub struct Model {
     pub capture: CaptureState,
     pub sources: SourceList,
     pub profile: Profile,
-    pub consent: Option<ConsentRequest>,
-    /// A request another program made (an agent, a script): the daemon handed us the code because we are its
-    /// consent handler, so the person must be able to answer it here (nobody else can).
-    pub external: Option<ConsentRequest>,
+    /// The requests the daemon holds for the person, oldest first: ours (see `own_request`) and other programs'
+    /// (an agent, a script). The daemon hands us every code because we are its consent handler, so the person must
+    /// be able to answer them all here (nobody else can).
+    pub requests: Vec<ConsentRequest>,
+    /// The id the daemon gave our own `record.start` when it held it for consent.
+    pub own_request: Option<String>,
+    /// The request the person allowed, until the daemon confirms.
+    pub approving: Option<ConsentRequest>,
+    /// When we started waiting for an answer to our own request (the first tick that saw it).
+    pub awaiting_since: Option<Instant>,
     /// Set when we are not the daemon's consent handler: the approval is on the daemon's terminal.
     pub handler_problem: Option<String>,
     pub stats: Stats,
@@ -315,8 +329,10 @@ impl Default for Model {
             capture: CaptureState::Unknown,
             sources: SourceList::default(),
             profile: Profile::Work,
-            consent: None,
-            external: None,
+            requests: Vec::new(),
+            own_request: None,
+            approving: None,
+            awaiting_since: None,
             handler_problem: None,
             stats: Stats::default(),
             started_at: None,
@@ -358,14 +374,20 @@ impl Model {
         }
     }
 
-    /// The consent dialog is up: waiting for the person, with the held request known. The flag says whether it is
-    /// our own start (true) or another program's request (false).
+    /// The request the dialog shows, and whether it is our own start (true) or another program's (false). Ours only
+    /// when its id is the one the daemon gave our `record.start`; everything else is labelled as another program's,
+    /// with the daemon's exact lines. Nothing is shown while our own start is in flight (its id is not known yet), or
+    /// while recording.
     pub fn consent_dialog(&self) -> Option<(&ConsentRequest, bool)> {
-        if self.phase == Phase::AwaitingConsent {
-            self.consent.as_ref().map(|c| (c, true))
-        } else {
-            self.external.as_ref().map(|c| (c, false))
+        if matches!(self.phase, Phase::Starting | Phase::Recording | Phase::Stopping) {
+            return None;
         }
+        let own = self.own_request.as_deref().filter(|_| self.phase == Phase::AwaitingConsent);
+        own.and_then(|id| self.requests.iter().find(|r| r.request_id == id)).map(|r| (r, true)).or_else(|| self.requests.first().map(|r| (r, false)))
+    }
+
+    fn drop_request(&mut self, id: &str) {
+        self.requests.retain(|r| r.request_id != id);
     }
 
     /// What the preview area says. There is no live picture yet (the engine records but does not stream frames to
@@ -432,7 +454,7 @@ impl Model {
                 if self.can_start() {
                     self.phase = Phase::Starting;
                     self.notice = None;
-                    self.consent = None;
+                    self.own_request = None;
                     return vec![Effect::StartRecording];
                 }
             }
@@ -440,70 +462,100 @@ impl Model {
                 if self.phase == Phase::Starting {
                     self.phase = Phase::Recording;
                     self.started_at = Some(at);
-                    self.consent = None;
+                    self.own_request = None;
                     self.stats = Stats::from_json(&status);
                 }
             }
-            Msg::StartFailed { code, message } => {
+            Msg::StartFailed { code, message, request_id } => {
                 if self.phase == Phase::Starting {
                     if code == CONSENT_REQUIRED {
                         self.phase = Phase::AwaitingConsent;
+                        self.own_request = request_id;
+                        self.awaiting_since = None;
                     } else {
                         self.fail(message);
                     }
                 }
             }
-            Msg::ConsentRequested(req) => match self.phase {
-                Phase::Starting | Phase::AwaitingConsent => self.consent = Some(req),
-                Phase::Idle | Phase::Error(_) => self.external = Some(req),
+            Msg::ConsentRequested(req) => {
                 // a recording is running: the daemon refuses a second one before it asks anyone
-                Phase::Recording | Phase::Stopping => {}
-            },
+                if !matches!(self.phase, Phase::Recording | Phase::Stopping) {
+                    self.drop_request(&req.request_id);
+                    self.requests.push(req);
+                }
+            }
+            Msg::ConsentSuperseded { request_id } => {
+                self.drop_request(&request_id);
+                if self.phase == Phase::AwaitingConsent && self.own_request.as_deref() == Some(request_id.as_str()) {
+                    self.phase = Phase::Idle;
+                    self.own_request = None;
+                    self.notice =
+                        Some(tr("Your request was replaced by a different one before you answered: press Record to ask again.").to_string());
+                }
+            }
             Msg::HandlerUnavailable(why) => self.handler_problem = Some(why),
             Msg::HandlerRegistered => self.handler_problem = None,
             Msg::Allow => {
-                // our own start: the same record.start is re-sent when the daemon confirms the approval
                 if let Some((req, _)) = self.consent_dialog() {
-                    return vec![Effect::Approve(req.token.clone())];
+                    let req = req.clone();
+                    let token = req.token.clone();
+                    // our own start: the same record.start is re-sent when the daemon confirms the approval
+                    self.approving = Some(req);
+                    return vec![Effect::Approve(token)];
                 }
             }
             Msg::Approved => {
-                if self.phase == Phase::AwaitingConsent {
-                    self.phase = Phase::Starting;
-                    self.consent = None;
-                    return vec![Effect::StartRecording];
-                } else if self.external.take().is_some() {
+                if let Some(req) = self.approving.take() {
+                    self.drop_request(&req.request_id);
+                    if self.phase == Phase::AwaitingConsent && self.own_request.as_deref() == Some(req.request_id.as_str()) {
+                        self.phase = Phase::Starting;
+                        self.own_request = None;
+                        return vec![Effect::StartRecording];
+                    }
                     // the other program's request is approved; it starts it, not us
                     self.notice = Some(tr("Allowed: the program that asked can start recording now.").to_string());
                 }
             }
             Msg::ApproveFailed(why) => {
-                if self.phase == Phase::AwaitingConsent {
-                    self.fail(why);
-                } else if self.external.take().is_some() {
-                    self.notice = Some(why);
+                if let Some(req) = self.approving.take() {
+                    self.drop_request(&req.request_id);
+                    if self.phase == Phase::AwaitingConsent && self.own_request.as_deref() == Some(req.request_id.as_str()) {
+                        self.fail(why);
+                    } else {
+                        self.notice = Some(why);
+                    }
                 }
             }
             Msg::Deny => {
-                if self.phase == Phase::AwaitingConsent {
-                    if let Some(req) = self.consent.take() {
+                if let Some((req, own)) = self.consent_dialog() {
+                    let req = req.clone();
+                    self.drop_request(&req.request_id);
+                    if own {
                         self.phase = Phase::Idle;
-                        self.notice = Some(tr("You did not allow the recording: nothing was recorded.").to_string());
-                        return vec![Effect::Deny(req.token)];
+                        self.own_request = None;
                     }
-                } else if let Some(req) = self.external.take() {
                     self.notice = Some(tr("You did not allow the recording: nothing was recorded.").to_string());
                     return vec![Effect::Deny(req.token)];
                 }
             }
             Msg::Tick(now) => {
-                if self.external.as_ref().is_some_and(|c| c.expired(now)) {
-                    self.external = None;
-                }
-                if self.phase == Phase::AwaitingConsent && self.consent.as_ref().is_some_and(|c| c.expired(now)) {
-                    self.consent = None;
-                    self.phase = Phase::Idle;
-                    self.notice = Some(tr("The request expired without an answer: nothing was recorded.").to_string());
+                self.requests.retain(|r| !r.expired(now));
+                if self.phase == Phase::AwaitingConsent {
+                    let since = *self.awaiting_since.get_or_insert(now);
+                    let waited = now.saturating_duration_since(since);
+                    let gone = match &self.own_request {
+                        // our request was held and has now expired or been answered elsewhere (it may still be
+                        // on its way for a moment after the reply)
+                        Some(id) => waited >= Duration::from_secs(5) && !self.requests.iter().any(|r| &r.request_id == id),
+                        // we never learned which request is ours: give up when it would have expired anyway
+                        None => waited >= Duration::from_secs(130),
+                    };
+                    if gone {
+                        self.phase = Phase::Idle;
+                        self.own_request = None;
+                        self.awaiting_since = None;
+                        self.notice = Some(tr("The request expired without an answer: nothing was recorded.").to_string());
+                    }
                 }
             }
             Msg::StopClicked => {
@@ -554,7 +606,8 @@ impl Model {
     fn fail(&mut self, why: String) {
         self.phase = Phase::Error(why);
         self.started_at = None;
-        self.consent = None;
+        self.own_request = None;
+        self.approving = None;
     }
 }
 
@@ -569,28 +622,18 @@ mod tests {
         m
     }
 
-    fn request(now: Instant) -> ConsentRequest {
+    fn req(id: &str, token: &str, now: Instant) -> ConsentRequest {
         ConsentRequest {
-            what: "source: Monitor { connector: \"DP-1\" }\nfile: \"a.mp4\"".into(),
-            token: "t0k3n".into(),
+            request_id: id.into(),
+            what: format!("source: x\nfile: {id:?}"),
+            token: token.into(),
             received: now,
             ttl: Duration::from_secs(120),
         }
     }
 
-    #[test]
-    fn the_record_button_needs_the_daemon_and_a_working_capture() {
-        let mut m = Model::default();
-        assert!(!m.can_start());
-        assert!(m.update(Msg::StartClicked).is_empty(), "nothing happens while the service is not there");
-        assert_eq!(m.phase, Phase::Idle);
-        m.update(Msg::DaemonReady);
-        assert!(!m.can_start(), "the daemon alone is not enough");
-        m.update(Msg::Sources(Err("no screencast".into())));
-        assert!(!m.can_start());
-        assert_eq!(m.capture, CaptureState::Unavailable("no screencast".into()));
-        m.update(Msg::Sources(Ok(SourceList::default())));
-        assert!(m.can_start());
+    fn consent_failed(id: Option<&str>) -> Msg {
+        Msg::StartFailed { code: CONSENT_REQUIRED, message: "consent_required".into(), request_id: id.map(str::to_string) }
     }
 
     #[test]
@@ -600,13 +643,14 @@ mod tests {
         assert_eq!(m.update(Msg::StartClicked), vec![Effect::StartRecording]);
         assert_eq!(m.phase, Phase::Starting);
         // the daemon's push can come before the reply...
-        m.update(Msg::ConsentRequested(request(t0)));
-        assert!(m.consent_dialog().is_none(), "no dialog until the daemon has said consent_required");
-        m.update(Msg::StartFailed { code: CONSENT_REQUIRED, message: "consent_required".into() });
+        m.update(Msg::ConsentRequested(req("mine", "t0k3n", t0)));
+        assert!(m.consent_dialog().is_none(), "nothing is shown until our own start's reply says which request is ours");
+        m.update(consent_failed(Some("mine")));
         assert_eq!(m.phase, Phase::AwaitingConsent);
-        assert_eq!(m.consent_dialog().unwrap().0.token, "t0k3n");
+        let (r, own) = m.consent_dialog().unwrap();
+        assert!(own, "the id matches the one the daemon gave our record.start");
+        assert_eq!(r.token, "t0k3n");
         assert!(!m.can_start(), "no second start while waiting");
-        // allow: approve first, then the same start again
         assert_eq!(m.update(Msg::Allow), vec![Effect::Approve("t0k3n".into())]);
         assert_eq!(m.update(Msg::Approved), vec![Effect::StartRecording]);
         assert_eq!(m.phase, Phase::Starting);
@@ -627,45 +671,99 @@ mod tests {
     }
 
     #[test]
+    fn the_push_after_the_reply_is_still_ours_by_id() {
+        let t0 = Instant::now();
+        let mut m = ready();
+        m.update(Msg::StartClicked);
+        m.update(consent_failed(Some("mine")));
+        assert!(m.consent_dialog().is_none(), "waiting for the description");
+        m.update(Msg::ConsentRequested(req("mine", "a", t0)));
+        assert!(m.consent_dialog().unwrap().1);
+    }
+
+    #[test]
+    fn another_programs_request_arriving_during_our_start_is_labelled_external() {
+        let t0 = Instant::now();
+        let mut m = ready();
+        m.update(Msg::StartClicked);
+        // someone else's request is pushed while our start is in flight, and it is not the one our reply names
+        m.update(Msg::ConsentRequested(req("theirs", "x", t0)));
+        m.update(consent_failed(Some("mine")));
+        let (r, own) = m.consent_dialog().unwrap();
+        assert_eq!(r.request_id, "theirs");
+        assert!(!own, "never shown as ours: the person must not approve it believing the app asked");
+        // approving it does not start our recording
+        assert_eq!(m.update(Msg::Allow), vec![Effect::Approve("x".into())]);
+        assert!(m.update(Msg::Approved).is_empty());
+        assert_eq!(m.phase, Phase::AwaitingConsent, "ours is still waiting");
+        assert!(m.notice.is_some());
+        // ours arrives and is ours
+        m.update(Msg::ConsentRequested(req("mine", "m", t0)));
+        assert!(m.consent_dialog().unwrap().1);
+        // with the two held, ours is shown first
+        m.update(Msg::ConsentRequested(req("theirs2", "y", t0)));
+        assert_eq!(m.consent_dialog().unwrap().0.request_id, "mine");
+    }
+
+    #[test]
+    fn a_reply_without_an_id_never_makes_a_request_ours() {
+        let t0 = Instant::now();
+        let mut m = ready();
+        m.update(Msg::StartClicked);
+        m.update(Msg::ConsentRequested(req("r", "t", t0)));
+        m.update(consent_failed(None));
+        assert!(!m.consent_dialog().unwrap().1);
+    }
+
+    #[test]
     fn another_programs_request_is_answered_here_without_starting_our_own_recording() {
         let t0 = Instant::now();
         let mut m = ready();
-        // an agent asked the daemon to record; the daemon gave us the code (we are the handler), nobody else can answer
-        m.update(Msg::ConsentRequested(request(t0)));
-        let (req, own) = m.consent_dialog().expect("the dialog is up");
+        m.update(Msg::ConsentRequested(req("agent", "t0k3n", t0)));
+        let (r, own) = m.consent_dialog().expect("the dialog is up");
         assert!(!own);
-        assert_eq!(req.token, "t0k3n");
+        assert_eq!(r.token, "t0k3n");
         assert_eq!(m.update(Msg::Allow), vec![Effect::Approve("t0k3n".into())]);
         assert!(m.update(Msg::Approved).is_empty(), "approving another program's request does not start our recording");
         assert_eq!(m.phase, Phase::Idle);
         assert!(m.consent_dialog().is_none());
         assert!(m.notice.is_some());
-        // denying
-        m.update(Msg::ConsentRequested(request(t0)));
-        assert_eq!(m.update(Msg::Deny), vec![Effect::Deny("t0k3n".into())]);
+        m.update(Msg::ConsentRequested(req("agent2", "t2", t0)));
+        assert_eq!(m.update(Msg::Deny), vec![Effect::Deny("t2".into())]);
         assert!(m.consent_dialog().is_none());
-        // an unanswered one goes away
-        m.update(Msg::ConsentRequested(request(t0)));
+        m.update(Msg::ConsentRequested(req("agent3", "t3", t0)));
         m.update(Msg::Tick(t0 + Duration::from_secs(121)));
-        assert!(m.consent_dialog().is_none());
-        // while recording nothing is shown
+        assert!(m.consent_dialog().is_none(), "an unanswered one goes away");
         let mut r = ready();
         r.update(Msg::StartClicked);
         r.update(Msg::Started { at: t0, status: json!({}) });
-        r.update(Msg::ConsentRequested(request(t0)));
-        assert!(r.consent_dialog().is_none());
+        r.update(Msg::ConsentRequested(req("late", "t", t0)));
+        assert!(r.consent_dialog().is_none(), "while recording nothing is shown");
     }
 
     #[test]
-    fn the_daemons_push_may_also_come_after_the_reply() {
+    fn a_replaced_request_disappears_and_ours_going_away_is_said() {
         let t0 = Instant::now();
         let mut m = ready();
+        m.update(Msg::ConsentRequested(req("a", "ta", t0)));
+        m.update(Msg::ConsentSuperseded { request_id: "a".into() });
+        assert!(m.consent_dialog().is_none());
+        m.update(Msg::ConsentRequested(req("b", "tb", t0)));
+        assert_eq!(m.consent_dialog().unwrap().0.token, "tb");
+        // ours is replaced by another program's request while we wait
+        let mut m = ready();
         m.update(Msg::StartClicked);
-        m.update(Msg::StartFailed { code: CONSENT_REQUIRED, message: "consent_required".into() });
-        assert_eq!(m.phase, Phase::AwaitingConsent);
-        assert!(m.consent_dialog().is_none(), "waiting for the description");
-        m.update(Msg::ConsentRequested(request(t0)));
-        assert!(m.consent_dialog().is_some());
+        m.update(Msg::ConsentRequested(req("mine", "tm", t0)));
+        m.update(consent_failed(Some("mine")));
+        assert!(m.consent_dialog().unwrap().1);
+        m.update(Msg::ConsentSuperseded { request_id: "mine".into() });
+        m.update(Msg::ConsentRequested(req("theirs", "tt", t0)));
+        assert_eq!(m.phase, Phase::Idle, "our start is over: it must be asked again");
+        assert!(m.notice.is_some());
+        let (r, own) = m.consent_dialog().unwrap();
+        assert_eq!(r.request_id, "theirs");
+        assert!(!own, "the replacement is shown as another program's");
+        assert!(m.can_start());
     }
 
     #[test]
@@ -673,49 +771,71 @@ mod tests {
         let t0 = Instant::now();
         let mut m = ready();
         m.update(Msg::StartClicked);
-        m.update(Msg::ConsentRequested(request(t0)));
-        m.update(Msg::StartFailed { code: CONSENT_REQUIRED, message: String::new() });
+        m.update(Msg::ConsentRequested(req("mine", "t0k3n", t0)));
+        m.update(consent_failed(Some("mine")));
         assert_eq!(m.update(Msg::Deny), vec![Effect::Deny("t0k3n".into())]);
         assert_eq!(m.phase, Phase::Idle);
         assert!(m.notice.is_some());
         assert!(m.can_start());
-        // Allow/Deny without a request do nothing
         assert!(m.update(Msg::Allow).is_empty());
         assert!(m.update(Msg::Deny).is_empty());
     }
 
     #[test]
-    fn an_unanswered_request_expires_back_to_idle() {
+    fn our_unanswered_request_expires_back_to_idle() {
         let t0 = Instant::now();
         let mut m = ready();
         m.update(Msg::StartClicked);
-        m.update(Msg::ConsentRequested(request(t0)));
-        m.update(Msg::StartFailed { code: CONSENT_REQUIRED, message: String::new() });
+        m.update(Msg::ConsentRequested(req("mine", "t", t0)));
+        m.update(consent_failed(Some("mine")));
+        m.update(Msg::Tick(t0 + Duration::from_secs(1)));
         m.update(Msg::Tick(t0 + Duration::from_secs(60)));
         assert_eq!(m.phase, Phase::AwaitingConsent);
         assert_eq!(m.consent_dialog().unwrap().0.seconds_left(t0 + Duration::from_secs(60)), 60);
         m.update(Msg::Tick(t0 + Duration::from_secs(121)));
         assert_eq!(m.phase, Phase::Idle);
-        assert!(m.consent.is_none());
+        assert!(m.requests.is_empty());
+        // and one that never got a description (no handler) does not lock the button forever
+        let mut m = ready();
+        m.update(Msg::StartClicked);
+        m.update(consent_failed(None));
+        m.update(Msg::Tick(t0));
+        m.update(Msg::Tick(t0 + Duration::from_secs(131)));
+        assert_eq!(m.phase, Phase::Idle);
     }
 
     #[test]
     fn errors_are_shown_and_can_be_dismissed() {
+        let t0 = Instant::now();
         let mut m = ready();
         m.update(Msg::StartClicked);
-        m.update(Msg::StartFailed { code: -32000, message: "folder not yours".into() });
+        m.update(Msg::StartFailed { code: -32000, message: "folder not yours".into(), request_id: None });
         assert_eq!(m.phase, Phase::Error("folder not yours".into()));
         assert!(m.can_start(), "trying again is allowed from an error");
         m.update(Msg::DismissError);
         assert_eq!(m.phase, Phase::Idle);
-        // an approval the daemon refuses is an error, not a silent start
         m.update(Msg::StartClicked);
-        m.update(Msg::StartFailed { code: CONSENT_REQUIRED, message: String::new() });
-        m.update(Msg::ConsentRequested(request(Instant::now())));
+        m.update(Msg::ConsentRequested(req("mine", "t", t0)));
+        m.update(consent_failed(Some("mine")));
         m.update(Msg::Allow);
         m.update(Msg::ApproveFailed("Invalid or expired approval code".into()));
         assert_eq!(m.phase, Phase::Error("Invalid or expired approval code".into()));
-        assert!(m.consent.is_none());
+        assert!(m.requests.is_empty());
+    }
+
+    #[test]
+    fn the_record_button_needs_the_daemon_and_a_working_capture() {
+        let mut m = Model::default();
+        assert!(!m.can_start());
+        assert!(m.update(Msg::StartClicked).is_empty(), "nothing happens while the service is not there");
+        assert_eq!(m.phase, Phase::Idle);
+        m.update(Msg::DaemonReady);
+        assert!(!m.can_start(), "the daemon alone is not enough");
+        m.update(Msg::Sources(Err("no screencast".into())));
+        assert!(!m.can_start());
+        assert_eq!(m.capture, CaptureState::Unavailable("no screencast".into()));
+        m.update(Msg::Sources(Ok(SourceList::default())));
+        assert!(m.can_start());
     }
 
     #[test]

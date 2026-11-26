@@ -30,5 +30,6 @@
   "Only the registered consent handler may decide": "Só quem foi registrado para tratar o consentimento pode decidir",
   "A handler must be a socket connection": "Quem trata o consentimento precisa ser uma conexão do socket",
   "Only the daemon's own user may handle consent": "Só a própria pessoa dona do serviço pode tratar o consentimento",
-  "A consent handler is already registered": "Já existe quem trate o consentimento"
+  "A consent handler is already registered": "Já existe quem trate o consentimento",
+  "The consent handler could not be authenticated": "Não foi possível autenticar quem trata o consentimento"
 }

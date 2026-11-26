@@ -40,12 +40,75 @@ pub fn find_binary() -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|d| d.join("kalango-castd")).find(|p| is_exe(p)))
 }
 
+/// The descriptor number the daemon finds its secret pipe on.
+const SECRET_FD: i32 = 3;
+
+/// A random secret (256 bits, hex) from the kernel.
+fn new_secret() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut b = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// Starts `cmd` with a fresh secret in an inherited pipe: the child finds it on descriptor 3 (`--secret-fd 3` is added
+/// to its arguments). The secret is in neither the environment, nor the arguments, nor any file; the parent keeps it
+/// in memory only and closes its end of the pipe. Returns the child and the secret.
+pub fn spawn_with_secret(cmd: &mut Command) -> std::io::Result<(Child, String)> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    let secret = new_secret()?;
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe2 fills the two descriptors we pass.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors are fresh and ours; OwnedFd closes them.
+    let (read_end, write_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // a small secret fits the pipe's buffer: written now, so the daemon can read it whenever it starts
+    let mut w = std::fs::File::from(write_end);
+    w.write_all(secret.as_bytes())?;
+    drop(w);
+    // keep the read end clear of descriptor 3 so the dup2 below always clears close-on-exec
+    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor >= 10 for the one we own.
+    let high = unsafe { libc::fcntl(read_end.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    if high < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `high` is a fresh descriptor we own.
+    let high = unsafe { OwnedFd::from_raw_fd(high) };
+    drop(read_end);
+    cmd.arg("--secret-fd").arg(SECRET_FD.to_string());
+    let src = high.as_raw_fd();
+    // SAFETY: the closure runs between fork and exec and only calls dup2, which is async-signal-safe; dup2 gives the
+    // new descriptor 3 without close-on-exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(src, SECRET_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    drop(high);
+    Ok((child, secret))
+}
+
 /// The service as the app sees it; dropping it stops the daemon if the app started it.
 pub struct Service {
     child: Option<Child>,
+    /// The consent-handler secret of the daemon we spawned (memory only; never logged or written).
+    secret: Option<String>,
 }
 
 impl Service {
+    /// The secret to register as the consent handler with (only for a daemon this app spawned).
+    pub fn secret(&self) -> Option<&str> {
+        self.secret.as_deref()
+    }
+
     /// Whether this app started the daemon (and so stops it on exit).
     pub fn started_by_app(&self) -> bool {
         self.child.is_some()
@@ -54,7 +117,7 @@ impl Service {
     /// Uses the daemon on `socket` if there is one, otherwise starts `binary` on it and waits until it answers.
     pub fn ensure_running(socket: &Path, binary: Option<&Path>) -> Result<Service, String> {
         if is_running(socket) {
-            return Ok(Service { child: None });
+            return Ok(Service { child: None, secret: None });
         }
         let binary = binary.ok_or_else(|| tr("kalango-castd was not found: install it next to this app or set KALANGO_CASTD").to_string())?;
         let mut cmd = Command::new(binary);
@@ -64,11 +127,11 @@ impl Service {
             Some(f) => cmd.stderr(Stdio::from(f)),
             None => cmd.stderr(Stdio::null()),
         };
-        let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", binary.display()))?;
+        let (mut child, secret) = spawn_with_secret(&mut cmd).map_err(|e| format!("{}: {e}", binary.display()))?;
         let end = Instant::now() + START_TIMEOUT;
         loop {
             if is_running(socket) {
-                return Ok(Service { child: Some(child) });
+                return Ok(Service { child: Some(child), secret: Some(secret) });
             }
             if let Ok(Some(status)) = child.try_wait() {
                 let how = match (status.code(), status.signal()) {
@@ -176,6 +239,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_secret_reaches_the_child_on_fd_3_and_is_nowhere_else() {
+        let dir = scratch("secret-fd");
+        let out = dir.join("seen");
+        // a stand-in child: copies what it finds on descriptor 3 to a file, then waits so /proc can be read
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("cat <&3 > \"$0\"; sleep 30").arg(&out);
+        let (mut child, secret) = spawn_with_secret(&mut cmd).unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&out).map(|s| s.is_empty()).unwrap_or(true) {
+            assert!(Instant::now() < end, "the child never read the secret");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), secret);
+        assert_eq!(secret.len(), 64);
+        let pid = child.id();
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+        let has = |hay: &[u8]| hay.windows(secret.len()).any(|w| w == secret.as_bytes());
+        assert!(!has(&cmdline), "not in the arguments");
+        assert!(!has(&environ), "not in the environment");
+        assert!(String::from_utf8_lossy(&cmdline).contains("--secret-fd"));
+        // and two spawns never share a secret
+        let (mut c2, s2) = spawn_with_secret(Command::new("/bin/sleep").arg("30")).unwrap();
+        assert_ne!(secret, s2);
+        let _ = (child.kill(), child.wait(), c2.kill(), c2.wait());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The real program, started as a child and stopped when the service is dropped. Needs a built `kalango-castd`:
     /// `KALANGO_CASTD=target/debug/kalango-castd cargo test -p kalango-cast-app -- --ignored`.
     #[test]
@@ -187,6 +279,13 @@ mod tests {
         let mut s = Service::ensure_running(&sock, Some(&bin)).unwrap();
         assert!(s.started_by_app());
         assert!(is_running(&sock));
+        // the real daemon: the secret is in neither its arguments nor its environment
+        let secret = s.secret().unwrap().to_string();
+        let pid = s.child.as_ref().unwrap().id();
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        assert!(!cmdline.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        // (it set PR_SET_DUMPABLE=0, so its environ is not even readable by the same user)
+        assert!(std::fs::read(format!("/proc/{pid}/environ")).is_err(), "environ is closed to other processes");
         s.stop();
         assert!(!is_running(&sock), "stopped with the app");
         let _ = std::fs::remove_dir_all(&dir);
