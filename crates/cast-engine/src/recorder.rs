@@ -66,6 +66,10 @@ fn default_cursor() -> bool {
     true
 }
 
+pub const MIN_FPS: u32 = 1;
+pub const MAX_FPS: u32 = 240;
+pub const MAX_BITRATE_KBPS: u32 = 500_000;
+
 impl RecordOptions {
     pub fn new(source: Source, path: PathBuf) -> Self {
         RecordOptions {
@@ -81,6 +85,13 @@ impl RecordOptions {
             cursor: true,
             overwrite: false,
         }
+    }
+
+    /// Brings numbers into the range the encoders and the muxer take, whoever filled them (the RPC and the command
+    /// line share these limits).
+    pub fn normalize(&mut self) {
+        self.fps = self.fps.clamp(MIN_FPS, MAX_FPS);
+        self.bitrate_kbps = self.bitrate_kbps.min(MAX_BITRATE_KBPS);
     }
 
     fn audio_targets(&self) -> Vec<(AudioTarget, &'static str)> {
@@ -165,6 +176,7 @@ pub struct Recorder {
     cpu_start: u64,
     nvml: Option<Nvml>,
     error: Arc<Mutex<Option<String>>>,
+    audio_error: Option<String>,
 }
 
 struct VideoState {
@@ -358,6 +370,9 @@ impl AudioSink for AudioState {
     }
 }
 
+/// How many audio packets (20 ms each) wait for the video track before the oldest news is dropped.
+const EARLY_AUDIO_MAX: usize = 2000;
+
 /// Opens the writer once the video track is known.
 type Opener = Box<dyn FnOnce(&cast_mux::Config) -> std::io::Result<Writer> + Send>;
 
@@ -447,8 +462,12 @@ fn mux_thread(
                     }
                     let _ = recycle_audio.send(data);
                 }
-                None if early.len() < 2000 => early.push_back((track, data, pts_ns)),
-                None => {}
+                None if early.len() < EARLY_AUDIO_MAX => early.push_back((track, data, pts_ns)),
+                None => {
+                    // the video track never came: the packet is lost, and it is counted like any other drop
+                    counters.audio_dropped.fetch_add(1, Ordering::Relaxed);
+                    let _ = recycle_audio.send(data);
+                }
             },
             MuxMsg::Finish => break,
         }
@@ -463,6 +482,14 @@ fn mux_thread(
             e
         }),
         None => Err(tr("No video frame arrived").into()),
+    }
+}
+
+/// The sound capture's start: the recording goes on without sound when it fails, and the reason is kept to show.
+fn audio_outcome<T>(started: Result<T, cast_capture::CaptureError>) -> (Option<T>, Option<String>) {
+    match started {
+        Ok(a) => (Some(a), None),
+        Err(e) => (None, Some(format!("{}: {}", tr("sound not recorded"), e.0))),
     }
 }
 
@@ -585,17 +612,15 @@ impl Recorder {
         };
         counters.dmabuf.store(video.counters.dmabuf.load(Ordering::Relaxed), Ordering::Relaxed);
 
-        let audio = if targets.is_empty() {
-            None
+        let (audio, audio_error) = if targets.is_empty() {
+            (None, None)
         } else {
             let state = AudioState { clock, tracks: audio_states, pool: audio_pool, mux: mux_tx.clone(), counters: counters.clone() };
-            match AudioCapture::start(targets.iter().map(|(t, _)| t.clone()).collect(), Box::new(state)) {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    eprintln!("{}: {e}", tr("sound not recorded"));
-                    None
-                }
+            let (audio, why) = audio_outcome(AudioCapture::start(targets.iter().map(|(t, _)| t.clone()).collect(), Box::new(state)));
+            if let Some(why) = &why {
+                eprintln!("{why}");
             }
+            (audio, why)
         };
         Ok(Recorder {
             audio_tracks: if audio.is_some() { targets.len() as u32 } else { 0 },
@@ -611,6 +636,7 @@ impl Recorder {
             cpu_start: stats::cpu_time_ns(),
             nvml: Nvml::open(),
             error,
+            audio_error,
         })
     }
 
@@ -650,6 +676,7 @@ impl Recorder {
             gpu_percent: gpu,
             gpu_encoder_percent: enc,
             error: self.error.lock().ok().and_then(|e| e.clone()),
+            audio_error: self.audio_error.clone(),
             origin_ns: started,
         }
     }
@@ -695,6 +722,28 @@ mod tests {
         assert!(!keyframe_due(Some(5_000_000_000), 6_999_999_999));
         assert!(keyframe_due(Some(5_000_000_000), 7_000_000_000));
         assert_eq!(KEYFRAME_NS, 2_000_000_000);
+    }
+
+    #[test]
+    fn normalize_limits_fps_and_bitrate_for_every_caller() {
+        let mut o = RecordOptions::new(Source::Window { id: 1 }, "/x/a.mp4".into());
+        (o.fps, o.bitrate_kbps) = (0, u32::MAX);
+        o.normalize();
+        assert_eq!((o.fps, o.bitrate_kbps), (MIN_FPS, MAX_BITRATE_KBPS));
+        (o.fps, o.bitrate_kbps) = (100_000, 8000);
+        o.normalize();
+        assert_eq!((o.fps, o.bitrate_kbps), (MAX_FPS, 8000));
+    }
+
+    #[test]
+    fn a_sound_that_cannot_start_is_reported_not_only_printed() {
+        let (a, why) = audio_outcome::<u8>(Err(cast_capture::CaptureError("no PipeWire".into())));
+        assert!(a.is_none());
+        assert!(why.unwrap().contains("no PipeWire"));
+        let (a, why) = audio_outcome(Ok(7u8));
+        assert_eq!((a, why), (Some(7), None));
+        let status = Status { audio_error: Some("x".into()), ..Status::default() };
+        assert_eq!(serde_json::to_value(&status).unwrap()["audio_error"], "x");
     }
 
     #[test]
@@ -770,6 +819,17 @@ mod tests {
         });
         wait_for("the writer to keep draining after a failure", || h.is_finished().then_some(()));
         h.join().unwrap();
+    }
+
+    #[test]
+    fn audio_that_waits_too_long_for_the_video_track_is_counted_as_dropped() {
+        let r = rig(false);
+        for i in 0..(EARLY_AUDIO_MAX as u64 + 50) {
+            r.tx.send(MuxMsg::Audio { track: 0, data: vec![1; 8], pts_ns: i * 20_000_000 }).unwrap();
+        }
+        r.tx.send(MuxMsg::Finish).unwrap();
+        assert!(r.mux.join().unwrap().is_err(), "no video frame arrived");
+        assert_eq!(r.counters.audio_dropped.load(Ordering::Relaxed), 50);
     }
 
     #[test]

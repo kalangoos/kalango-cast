@@ -96,6 +96,8 @@ pub struct Status {
     pub gpu_percent: Option<u32>,
     pub gpu_encoder_percent: Option<u32>,
     pub error: Option<String>,
+    /// The sound was asked for but could not start: the recording goes on without it (and says so).
+    pub audio_error: Option<String>,
     /// The recording's media clock origin (CLOCK_MONOTONIC ns): media time 0 in the file.
     pub origin_ns: u64,
 }

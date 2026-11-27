@@ -464,6 +464,8 @@ impl Model {
                     self.started_at = Some(at);
                     self.own_request = None;
                     self.stats = Stats::from_json(&status);
+                    // the sound was asked for and could not start: say so while the video records
+                    self.notice = status["audio_error"].as_str().map(str::to_string);
                 }
             }
             Msg::StartFailed { code, message, request_id } => {
@@ -836,6 +838,19 @@ mod tests {
         assert_eq!(m.capture, CaptureState::Unavailable("no screencast".into()));
         m.update(Msg::Sources(Ok(SourceList::default())));
         assert!(m.can_start());
+    }
+
+    #[test]
+    fn a_sound_that_could_not_start_is_shown_while_the_video_records() {
+        let mut m = ready();
+        m.update(Msg::StartClicked);
+        m.update(Msg::Started { at: Instant::now(), status: json!({"audio_error": "sound not recorded: no PipeWire"}) });
+        assert_eq!(m.phase, Phase::Recording);
+        assert_eq!(m.notice.as_deref(), Some("sound not recorded: no PipeWire"));
+        let mut m = ready();
+        m.update(Msg::StartClicked);
+        m.update(Msg::Started { at: Instant::now(), status: json!({"audio_error": null}) });
+        assert!(m.notice.is_none());
     }
 
     #[test]
