@@ -484,19 +484,28 @@ pub fn parse_start(params: &Value) -> Result<RecordOptions, RpcError> {
         return Err(bad(tr("The path must end in .mp4").into()));
     }
     let mut o = RecordOptions::new(source, path);
-    o.overwrite = params.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
-    if let Some(e) = params.get("encoder").and_then(|v| v.as_str()) {
+    // a field of the wrong type is an error, never silently the default: what the person approves is what runs
+    let typed = |name: &str, want: &str| bad(format!("{name}: {want}"));
+    if let Some(v) = params.get("overwrite").filter(|v| !v.is_null()) {
+        o.overwrite = v.as_bool().ok_or_else(|| typed("overwrite", "true or false"))?;
+    }
+    if let Some(v) = params.get("cursor").filter(|v| !v.is_null()) {
+        o.cursor = v.as_bool().ok_or_else(|| typed("cursor", "true or false"))?;
+    }
+    if let Some(v) = params.get("encoder").filter(|v| !v.is_null()) {
+        let e = v.as_str().ok_or_else(|| typed("encoder", "a name"))?;
         o.encoder = Some(cast_core::EncoderKind::parse(e).ok_or_else(|| bad(format!("encoder: {e}")))?);
     }
     if let Some(c) = params.get("codec") {
         o.codec = serde_json::from_value(c.clone()).map_err(|e| bad(format!("codec: {e}")))?;
     }
-    if let Some(f) = params.get("fps").and_then(|v| v.as_u64()) {
-        o.fps = f.clamp(1, 240) as u32;
+    if let Some(v) = params.get("fps").filter(|v| !v.is_null()) {
+        o.fps = v.as_u64().ok_or_else(|| typed("fps", "a whole number"))?.min(u32::MAX as u64) as u32;
     }
-    if let Some(b) = params.get("bitrate_kbps").and_then(|v| v.as_u64()) {
-        o.bitrate_kbps = b.min(500_000) as u32;
+    if let Some(v) = params.get("bitrate_kbps").filter(|v| !v.is_null()) {
+        o.bitrate_kbps = v.as_u64().ok_or_else(|| typed("bitrate_kbps", "a whole number"))?.min(u32::MAX as u64) as u32;
     }
+    o.normalize();
     o.desktop_audio = Some(audio_choice(params.get("desktop_audio")).ok_or_else(|| bad("desktop_audio".into()))?);
     o.mic = Some(audio_choice(params.get("mic")).ok_or_else(|| bad("mic".into()))?);
     for (what, c) in [("desktop_audio", &o.desktop_audio), ("mic", &o.mic)] {
@@ -538,13 +547,15 @@ fn describe(o: &RecordOptions) -> String {
         (false, false) => "new file",
     };
     format!(
-        "source: {:?}\ndesktop sound: {}\nmicrophone: {}\nvideo: {:?}, {} fps, bitrate {}\nmode: {mode}\nfolder: {:?}\nfile: {:?}",
+        "source: {:?}\ndesktop sound: {}\nmicrophone: {}\nvideo: {:?}, {} fps, bitrate {}, encoder {}, cursor {}\nmode: {mode}\nfolder: {:?}\nfile: {:?}",
         o.source,
         audio_text(&o.desktop_audio),
         audio_text(&o.mic),
         o.codec,
         o.fps,
         if o.bitrate_kbps == 0 { "automatic".to_string() } else { format!("{} kbit/s", o.bitrate_kbps) },
+        o.encoder.map_or("automatic".to_string(), |e| e.name().to_string()),
+        if o.cursor { "shown" } else { "hidden" },
         o.path.parent().unwrap_or(Path::new("/")),
         o.path.file_name().unwrap_or_default(),
     )
@@ -889,7 +900,20 @@ mod tests {
         assert_eq!(p(json!({"bitrate_kbps": 500_000})).unwrap().bitrate_kbps, 500_000);
         assert_eq!(p(json!({"bitrate_kbps": 500_001})).unwrap().bitrate_kbps, 500_000);
         assert!(p(json!({"overwrite": true})).unwrap().overwrite);
-        assert!(!p(json!({"overwrite": "yes"})).unwrap().overwrite, "only a real boolean overwrites");
+        assert_eq!(p(json!({"overwrite": "yes"})).unwrap_err().0, -32602, "only a real boolean overwrites");
+        for wrong in [
+            json!({"fps": "30"}),
+            json!({"fps": 29.5}),
+            json!({"fps": -1}),
+            json!({"bitrate_kbps": "8000"}),
+            json!({"encoder": 5}),
+            json!({"cursor": "no"}),
+        ] {
+            assert_eq!(p(wrong.clone()).unwrap_err().0, -32602, "{wrong}: a field of the wrong type is refused, not defaulted");
+        }
+        assert!(!p(json!({"cursor": false})).unwrap().cursor);
+        assert!(p(json!({})).unwrap().cursor);
+        assert_eq!(p(json!({"encoder": "nvenc"})).unwrap().encoder, Some(cast_core::EncoderKind::Nvenc));
         assert_eq!(p(json!({"desktop_audio": false})).unwrap().desktop_audio, Some(AudioChoice::Off));
         assert_eq!(p(json!({"mic": "usb"})).unwrap().mic, Some(AudioChoice::Named("usb".into())));
         assert_eq!(p(json!({"mic": 5})).unwrap_err().0, -32602);
@@ -974,6 +998,16 @@ mod tests {
             assert!(t.contains(part), "{part} in {t}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_description_says_the_encoder_and_the_cursor() {
+        let mut o = opts(json!({"encoder": "nvenc", "cursor": false}));
+        let t = describe(&o);
+        assert!(t.contains("encoder nvenc") && t.contains("cursor hidden"), "{t}");
+        o = opts(json!({}));
+        let t = describe(&o);
+        assert!(t.contains("encoder automatic") && t.contains("cursor shown"), "{t}");
     }
 
     #[test]

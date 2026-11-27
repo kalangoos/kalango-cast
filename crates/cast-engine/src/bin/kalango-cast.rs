@@ -58,7 +58,7 @@ fn record(args: &[String]) {
             "--monitor" => source = Some(Source::Monitor { connector: val() }),
             "--window" => source = Some(Source::Window { id: val().parse().unwrap_or_else(|_| usage()) }),
             "--area" => source = Some(parse_area(&val()).unwrap_or_else(|| usage())),
-            "--seconds" => seconds = val().parse().unwrap_or_else(|_| usage()),
+            "--seconds" => seconds = val().parse().ok().filter(|s: &f64| s.is_finite() && *s > 0.0).unwrap_or_else(|| usage()),
             "--out" => out = Some(PathBuf::from(val())),
             "--encoder" => encoder = Some(EncoderKind::parse(&val()).unwrap_or_else(|| usage())),
             "--codec" => {
@@ -101,6 +101,7 @@ fn record(args: &[String]) {
     o.mic = mic;
     o.dbus_address = bus;
     o.cursor = cursor;
+    o.normalize();
 
     // Ctrl+C / SIGTERM end the recording cleanly (the file is finished, not cut)
     // SAFETY: sigset operations on a local set; blocks the signals for this thread and the ones started later.
