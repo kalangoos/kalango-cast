@@ -669,8 +669,13 @@ impl App {
             return;
         }
         let (tx, socket, busy) = (self.tx.clone(), self.socket.clone(), self.sources_busy.clone());
+        // the daemon this app spawned hands window titles to whoever holds its secret (the app does)
+        let params = match self.secret.lock().ok().and_then(|s| s.clone()) {
+            Some(s) => json!({"secret": s}),
+            None => json!({}),
+        };
         let _ = std::thread::Builder::new().name("cast-sources".into()).spawn(move || {
-            let msg = match client::call(&socket, "sources.list", json!({}), Duration::from_secs(10)) {
+            let msg = match client::call(&socket, "sources.list", params, Duration::from_secs(10)) {
                 Ok(v) => Some(Msg::Sources(Ok(SourceList::from_json(&v)))),
                 Err(CallError::Rpc { message, .. }) => Some(Msg::Sources(Err(message))),
                 Err(CallError::Transport(m)) => {

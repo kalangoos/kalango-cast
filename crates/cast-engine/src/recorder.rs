@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::stats::{self, Counters, Nvml, Status};
 
+/// Called (from the writer thread) the moment a recording fails for good, with why.
+pub type FailNotify = Arc<dyn Fn(String) + Send + Sync>;
+
 /// A sound to record: the default device, a named one, or none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(untagged)]
@@ -378,13 +381,22 @@ type Opener = Box<dyn FnOnce(&cast_mux::Config) -> std::io::Result<Writer> + Sen
 
 /// The file cannot be written: remember why (visible in `Status::error`), tell the capture threads to stop, and drop
 /// the writer without finishing it (what is on disk stays playable up to its last complete fragment).
-fn fail_mux(e: String, failure: &mut Option<String>, error: &Mutex<Option<String>>, counters: &Counters, writer: &mut Option<Writer>) {
+fn fail_mux(
+    e: String,
+    failure: &mut Option<String>,
+    error: &Mutex<Option<String>>,
+    counters: &Counters,
+    writer: &mut Option<Writer>,
+    notify: &dyn Fn(String),
+) {
     counters.failed.store(true, Ordering::Release);
     if let Ok(mut slot) = error.lock() {
         slot.get_or_insert_with(|| e.clone());
     }
-    failure.get_or_insert(e);
+    failure.get_or_insert(e.clone());
     *writer = None;
+    // the person is told now, not when they stop (the daemon also stops the capture)
+    notify(e);
 }
 
 fn mux_thread(
@@ -395,6 +407,7 @@ fn mux_thread(
     recycle_audio: Sender<Vec<u8>>,
     counters: Arc<Counters>,
     error: Arc<Mutex<Option<String>>>,
+    notify: FailNotify,
 ) -> Result<Summary, String> {
     let mut open = Some(open);
     let mut writer: Option<Writer> = None;
@@ -432,10 +445,10 @@ fn mux_thread(
                         }
                         match result {
                             Ok(()) => writer = Some(w),
-                            Err(e) => fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer),
+                            Err(e) => fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer, &*notify),
                         }
                     }
-                    Err(e) => fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer),
+                    Err(e) => fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer, &*notify),
                 }
             }
             MuxMsg::Video { data, pts_ns, key, arrived_ns } => {
@@ -450,7 +463,7 @@ fn mux_thread(
                                 counters.fragments.store(fragments_seen, Ordering::Relaxed);
                             }
                         }
-                        Err(e) => fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer),
+                        Err(e) => fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer, &*notify),
                     }
                 }
                 let _ = recycle_video.send(data);
@@ -458,7 +471,7 @@ fn mux_thread(
             MuxMsg::Audio { track, data, pts_ns } => match writer.as_mut() {
                 Some(w) => {
                     if let Err(e) = w.write_audio(track, &data, pts_ns, FRAME_SAMPLES as u32) {
-                        fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer);
+                        fail_mux(e.to_string(), &mut failure, &error, &counters, &mut writer, &*notify);
                     }
                     let _ = recycle_audio.send(data);
                 }
@@ -478,7 +491,7 @@ fn mux_thread(
     match writer {
         Some(w) => w.finish().map_err(|e| {
             let e = e.to_string();
-            fail_mux(e.clone(), &mut None, &error, &counters, &mut None);
+            fail_mux(e.clone(), &mut None, &error, &counters, &mut None, &|_| {});
             e
         }),
         None => Err(tr("No video frame arrived").into()),
@@ -496,6 +509,11 @@ fn audio_outcome<T>(started: Result<T, cast_capture::CaptureError>) -> (Option<T
 impl Recorder {
     /// Starts recording; returns once the encoder is running (or with why it could not start).
     pub fn start(options: RecordOptions) -> Result<Recorder, String> {
+        Self::start_notify(options, Arc::new(|_| {}))
+    }
+
+    /// Like [`Recorder::start`]; `notify` is called when the recording fails later (a full disk).
+    pub fn start_notify(options: RecordOptions, notify: FailNotify) -> Result<Recorder, String> {
         if !options.path.is_absolute() {
             return Err(tr("The path must be absolute").into());
         }
@@ -512,7 +530,7 @@ impl Recorder {
             }
         })?;
         let path = options.path.clone();
-        Self::start_with_file(options, file).inspect_err(|_| {
+        Self::start_with_file(options, file, notify).inspect_err(|_| {
             // nothing was recorded: do not leave an empty file behind
             if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
                 let _ = std::fs::remove_file(&path);
@@ -520,7 +538,7 @@ impl Recorder {
         })
     }
 
-    fn start_with_file(options: RecordOptions, file: std::fs::File) -> Result<Recorder, String> {
+    fn start_with_file(options: RecordOptions, file: std::fs::File, notify: FailNotify) -> Result<Recorder, String> {
         let caps = cast_encode::probe();
         let kind = cast_encode::choose(&caps, options.encoder, options.codec).ok_or_else(|| {
             let why: Vec<String> = caps.iter().filter_map(|c| c.reason.as_ref().map(|r| format!("{}: {r}", c.kind.name()))).collect();
@@ -560,7 +578,7 @@ impl Recorder {
         let open: Opener = Box::new(move |config| Writer::from_file(file, config));
         let mux = std::thread::Builder::new()
             .name("cast-mux".into())
-            .spawn(move || mux_thread(open, audio_tracks, mux_rx, recycle_video, recycle_audio, c2, e2))
+            .spawn(move || mux_thread(open, audio_tracks, mux_rx, recycle_video, recycle_audio, c2, e2, notify))
             .map_err(|e| e.to_string())?;
 
         let (opened_tx, opened_rx) = mpsc::channel::<Opened>();
@@ -681,8 +699,9 @@ impl Recorder {
         }
     }
 
-    /// Stops capturing, writes the last fragment and the index; returns what the file holds.
-    pub fn stop(mut self) -> Result<(Summary, Status), String> {
+    /// Stops the capture (video, sound, the compositor's session) and leaves the writer to `stop`: what a recording
+    /// that failed does, so nothing keeps running for a file that cannot be written. Safe to repeat.
+    pub fn halt_capture(&mut self) {
         if let Some(v) = self.video.take() {
             let _ = v.stop();
         }
@@ -690,6 +709,11 @@ impl Recorder {
             a.stop();
         }
         self._stream.stop();
+    }
+
+    /// Stops capturing, writes the last fragment and the index; returns what the file holds.
+    pub fn stop(mut self) -> Result<(Summary, Status), String> {
+        self.halt_capture();
         let status = Status { recording: false, ..self.status() };
         let _ = self.mux_tx.send(MuxMsg::Finish);
         let summary = self.mux.take().map(|m| m.join().unwrap_or_else(|_| Err("mux thread panicked".into()))).unwrap_or(Err(String::new()))?;
@@ -767,6 +791,7 @@ mod tests {
         /// The memfd the writer writes to (to seal it: a disk that stops accepting data).
         file: Arc<Mutex<Option<std::fs::File>>>,
         opened: Receiver<()>,
+        notified: Arc<Mutex<Vec<String>>>,
     }
 
     fn rig(open_dev_full: bool) -> Rig {
@@ -794,8 +819,11 @@ mod tests {
             w
         });
         let (c2, e2) = (counters.clone(), error.clone());
-        let mux = std::thread::spawn(move || mux_thread(open, vec![], rx, rv, ra, c2, e2));
-        Rig { tx, mux, counters, error, file, opened }
+        let notified = Arc::new(Mutex::new(Vec::new()));
+        let log = notified.clone();
+        let notify: FailNotify = Arc::new(move |e| log.lock().unwrap().push(e));
+        let mux = std::thread::spawn(move || mux_thread(open, vec![], rx, rv, ra, c2, e2, notify));
+        Rig { tx, mux, counters, error, file, opened, notified }
     }
 
     fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
@@ -849,6 +877,8 @@ mod tests {
         r.tx.send(video(2_100, true)).unwrap();
         let why = wait_for("the error", || r.error.lock().unwrap().clone());
         assert!(!why.is_empty());
+        // the failure is announced the moment it happens, with no stop in sight
+        assert_eq!(*r.notified.lock().unwrap(), vec![why.clone()], "told once, now");
         assert!(r.counters.failed.load(Ordering::Acquire), "capture is told to stop");
         flood_must_not_block(r.tx.clone());
         r.tx.send(MuxMsg::Finish).unwrap();
