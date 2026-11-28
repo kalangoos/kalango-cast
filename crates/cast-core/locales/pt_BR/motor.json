@@ -30,6 +30,7 @@
   "The path must end in .mp4": "O caminho precisa terminar em .mp4",
   "The path must not contain ..": "O caminho não pode conter ..",
   "The screencast sent no frames": "A captura de tela não enviou quadros",
+  "The start failed unexpectedly": "O início falhou de forma inesperada",
   "The start was cancelled": "O início foi cancelado",
   "Too many connections": "Conexões demais",
   "Unknown method": "Método desconhecido",
@@ -52,6 +53,7 @@
   "sound not recorded": "som não gravado",
   "the folder must be yours and closed to others (0700)": "a pasta precisa ser sua e fechada para os outros (0700)",
   "window {id}": "janela {id}",
+  "window {id} ({app}: {title})": "janela {id} ({app}: {title})",
   "{codec}, {fps} fps, bitrate {bitrate}, encoder {encoder}, cursor {cursor}": "{codec}, {fps} quadros/s, taxa de bits {bitrate}, codificador {encoder}, cursor {cursor}",
   "{n} kbit/s": "{n} kbit/s"
 }

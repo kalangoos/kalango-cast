@@ -299,8 +299,9 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(1);
 /// A recording the daemon holds: a real [`Recorder`], or a stand-in in tests.
 pub trait Running: Send {
     fn status(&self) -> Status;
-    /// Stops the capture and leaves the writer to `stop` (a recording that failed).
-    fn halt_capture(&mut self);
+    /// What stops the capture, leaving the writer to `stop` (a recording that failed). It is called without the
+    /// daemon's lock held: stopping the capture joins threads and talks to the compositor.
+    fn halt_handle(&self) -> Box<dyn FnOnce() + Send>;
     fn stop(self: Box<Self>) -> Result<(cast_mux::Summary, Status), String>;
 }
 
@@ -308,8 +309,9 @@ impl Running for Recorder {
     fn status(&self) -> Status {
         Recorder::status(self)
     }
-    fn halt_capture(&mut self) {
-        Recorder::halt_capture(self)
+    fn halt_handle(&self) -> Box<dyn FnOnce() + Send> {
+        let capture = self.capture();
+        Box::new(move || capture.halt())
     }
     fn stop(self: Box<Self>) -> Result<(cast_mux::Summary, Status), String> {
         Recorder::stop(*self)
@@ -347,11 +349,20 @@ struct Core {
     hook: Option<Hook>,
     ttl: Duration,
     next_id: AtomicU64,
+    /// Signalled when a start ends (a shutdown waits on it).
+    changed: std::sync::Condvar,
 }
 
 impl Default for Core {
     fn default() -> Self {
-        Core { slot: Mutex::new(Slot::Idle), handler: Mutex::new(None), hook: None, ttl: CONSENT_TTL, next_id: AtomicU64::new(0) }
+        Core {
+            slot: Mutex::new(Slot::Idle),
+            handler: Mutex::new(None),
+            hook: None,
+            ttl: CONSENT_TTL,
+            next_id: AtomicU64::new(0),
+            changed: std::sync::Condvar::new(),
+        }
     }
 }
 
@@ -382,33 +393,24 @@ impl Core {
 
     /// Recording `id` failed for good (its writer thread says so): tell the person now, and stop its capture.
     fn recording_failed(self: &Arc<Self>, id: u64, error: String) {
-        let path = {
+        let (path, halt) = {
             let Ok(mut slot) = self.slot.lock() else { return };
             match &mut *slot {
                 Slot::Starting { id: i, failed, .. } if *i == id => {
                     failed.get_or_insert(error.clone());
-                    None
+                    return;
                 }
                 Slot::Running { id: i, rec, notified } if *i == id && !*notified => {
                     *notified = true;
-                    Some(rec.status().path)
+                    (rec.status().path, rec.halt_handle())
                 }
-                _ => None,
+                _ => return,
             }
         };
-        let Some(path) = path else { return };
         self.emit(Event::RecordingFailed { path, error });
-        let core = self.clone();
-        // off the writer thread: stopping the capture waits for threads, and must not hold up the failed writer's drain
-        let _ = std::thread::Builder::new().name("cast-halt".into()).spawn(move || {
-            if let Ok(mut slot) = core.slot.lock() {
-                if let Slot::Running { id: i, rec, .. } = &mut *slot {
-                    if *i == id {
-                        rec.halt_capture();
-                    }
-                }
-            }
-        });
+        // off the writer thread and with no lock held: stopping the capture waits for threads and the compositor, and
+        // `record.status` and `record.stop` must keep answering meanwhile
+        let _ = std::thread::Builder::new().name("cast-halt".into()).spawn(halt);
     }
 }
 
@@ -649,6 +651,11 @@ fn fingerprint(o: &RecordOptions) -> String {
     format!("{o:?}")
 }
 
+/// Whether the window titles go to this caller: a daemon that allows everything, or a caller with the daemon's secret.
+fn titles_visible(consent: Consent, has_secret: bool) -> bool {
+    consent == Consent::Allow || has_secret
+}
+
 /// Takes what the windows say about their contents out of the list (their ids and the monitors stay).
 fn redact_titles(s: &mut cast_capture::Sources) {
     for w in &mut s.windows {
@@ -657,17 +664,39 @@ fn redact_titles(s: &mut cast_capture::Sources) {
     }
 }
 
+/// Text a client or the compositor chose, for the person to read: in quotes, backslash and quote escaped, and every
+/// control or invisible character shown as `\u{..}` (so nothing in it can fake a line or hide text).
+fn quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if is_unsafe_char(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn audio_text(c: &Option<AudioChoice>) -> String {
     match c {
         None | Some(AudioChoice::Off) => tr("off").into(),
         Some(AudioChoice::Default) => tr("default device").into(),
-        Some(AudioChoice::Named(n)) => format!("{n:?}"),
+        Some(AudioChoice::Named(n)) => quote(n),
     }
 }
 
-/// What the person is asked to approve, in words, built from the parsed request (what is shown is what runs). Names
-/// the client chose are printed escaped (`{:?}` on the text only) and the path comes last, on its own line.
+/// What the person is asked to approve, in words, built from the parsed request (what is shown is what runs).
+#[cfg(test)]
 fn describe(o: &RecordOptions) -> String {
+    describe_with(o, None)
+}
+
+/// [`describe`], naming the window (its app and title, as the compositor says) when they are known.
+fn describe_with(o: &RecordOptions, window: Option<(&str, &str)>) -> String {
     let exists = std::fs::symlink_metadata(&o.path).is_ok();
     let mode = match (o.overwrite, exists) {
         (true, true) => tr("REPLACES an existing recording"),
@@ -676,17 +705,14 @@ fn describe(o: &RecordOptions) -> String {
         (false, false) => tr("new file"),
     };
     let source = match &o.source {
-        Source::Monitor { connector } => trf("monitor {name}", &[("name", format!("{connector:?}"))]),
-        Source::Window { id } => trf("window {id}", &[("id", id.to_string())]),
+        Source::Monitor { connector } => trf("monitor {name}", &[("name", quote(connector))]),
+        Source::Window { id } => match window {
+            Some((app, title)) => trf("window {id} ({app}: {title})", &[("id", id.to_string()), ("app", quote(app)), ("title", quote(title))]),
+            None => trf("window {id}", &[("id", id.to_string())]),
+        },
         Source::Area { connector, x, y, width, height } => trf(
             "area {width}×{height} at {x},{y} of monitor {name}",
-            &[
-                ("width", width.to_string()),
-                ("height", height.to_string()),
-                ("x", x.to_string()),
-                ("y", y.to_string()),
-                ("name", format!("{connector:?}")),
-            ],
+            &[("width", width.to_string()), ("height", height.to_string()), ("x", x.to_string()), ("y", y.to_string()), ("name", quote(connector))],
         ),
     };
     let codec = match o.codec {
@@ -704,8 +730,8 @@ fn describe(o: &RecordOptions) -> String {
             ("cursor", if o.cursor { tr("shown") } else { tr("hidden") }.to_string()),
         ],
     );
-    let folder = format!("{:?}", o.path.parent().unwrap_or(Path::new("/")));
-    let file = format!("{:?}", o.path.file_name().unwrap_or_default());
+    let folder = quote(&o.path.parent().unwrap_or(Path::new("/")).to_string_lossy());
+    let file = quote(&o.path.file_name().unwrap_or_default().to_string_lossy());
     [
         (tr("Source"), source),
         (tr("Desktop sound"), audio_text(&o.desktop_audio)),
@@ -793,6 +819,22 @@ impl Daemon {
         Err((CONSENT_REQUIRED, format!("consent_required{ID_MARK}{id}")))
     }
 
+    /// The app and title of window `id`, as the compositor says (None when it cannot be asked: the person is then
+    /// shown the id only).
+    fn window_info(&self, id: u64) -> Option<(String, String)> {
+        let cast = cast_capture::ScreenCast::connect(self.dbus_address.as_deref()).ok()?;
+        let w = cast.sources().ok()?.windows.into_iter().find(|w| w.id == id)?;
+        Some((w.app_id, w.title))
+    }
+
+    /// The list as this caller may see it.
+    fn filter_sources(&self, params: &Value, mut s: cast_capture::Sources) -> cast_capture::Sources {
+        if !titles_visible(self.consent, self.authenticate(params).is_ok()) {
+            redact_titles(&mut s);
+        }
+        s
+    }
+
     /// Gives back the approval `check_consent` used up, after a start that failed for the environment once the output
     /// file was open. At most once per approval, never past the first approval's own deadline (the clock is not reset),
     /// and never for a different request than the one approved.
@@ -864,12 +906,10 @@ impl Daemon {
             })),
             "sources.list" => {
                 let cast = cast_capture::ScreenCast::connect(self.dbus_address.as_deref()).map_err(|e| app(e.0))?;
-                let mut s = cast.sources().map_err(|e| app(e.0))?;
+                let s = cast.sources().map_err(|e| app(e.0))?;
                 // window titles say what the person is doing: only the app that spawned this daemon (it holds the secret),
                 // or a daemon that was told to allow everything, hands them out
-                if self.consent != Consent::Allow && self.authenticate(params).is_err() {
-                    redact_titles(&mut s);
-                }
+                let s = self.filter_sources(params, s);
                 serde_json::to_value(s).map_err(|e| app(e.to_string()))
             }
             "consent.approve" => {
@@ -884,7 +924,11 @@ impl Daemon {
             "record.start" => {
                 let mut o = parse_start(params)?;
                 o.dbus_address = self.dbus_address.clone();
-                let (fp, what) = (fingerprint(&o), describe(&o));
+                let window = match &o.source {
+                    Source::Window { id } => self.window_info(*id),
+                    _ => None,
+                };
+                let (fp, what) = (fingerprint(&o), describe_with(&o, window.as_ref().map(|(a, t)| (a.as_str(), t.as_str()))));
                 // a recording that failed is over: tell, then make room for a new one (stopped outside the lock)
                 let failed = {
                     let mut slot = self.core.slot.lock().map_err(|_| app("lock".into()))?;
@@ -929,21 +973,27 @@ impl Daemon {
                     Arc::new(move |e| core.recording_failed(id, e))
                 };
                 let path = o.path.display().to_string();
-                let started = match &self.starter {
+                // a panic in the start (an encoder, a driver) must not leave the state at Starting for good
+                let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &self.starter {
                     Some(start) => start(o, notify),
                     None => Recorder::start_notify(o, notify).map(|r| Box::new(r) as Box<dyn Running>),
-                };
+                }))
+                .unwrap_or_else(|_| Err(StartError::environment(tr("The start failed unexpectedly"))));
                 let mut slot = self.core.slot.lock().map_err(|_| app("lock".into()))?;
                 let early_failure = match &mut *slot {
                     Slot::Starting { failed, .. } => failed.take(),
                     _ => None,
                 };
                 let cancelled = cancel.load(Ordering::Acquire);
-                match started {
+                let out = match started {
                     Ok(rec) if cancelled => {
                         *slot = Slot::Idle;
                         drop(slot);
                         let _ = rec.stop();
+                        // the file the cancelled start opened is not left behind empty
+                        if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+                            let _ = std::fs::remove_file(&path);
+                        }
                         Err(app(tr("The start was cancelled").into()))
                     }
                     Ok(rec) => {
@@ -966,7 +1016,9 @@ impl Daemon {
                         }
                         Err(app(e.message))
                     }
-                }
+                };
+                self.core.changed.notify_all();
+                out
             }
             "record.status" => {
                 let slot = self.core.slot.lock().map_err(|_| app("lock".into()))?;
@@ -1081,7 +1133,8 @@ impl Daemon {
         }
     }
 
-    /// Stops a running recording (the daemon is exiting), or cancels a start in progress.
+    /// Stops a running recording (the daemon is exiting). A start in progress is cancelled and waited for (up to
+    /// [`SHUTDOWN_WAIT`]), so the file it opened is closed, or removed when empty, before the process goes.
     pub fn shutdown(&self) {
         let rec = {
             let Ok(mut slot) = self.core.slot.lock() else { return };
@@ -1092,6 +1145,7 @@ impl Daemon {
                         cancel.store(true, Ordering::Release);
                     }
                     *slot = s;
+                    let _ = self.core.changed.wait_timeout_while(slot, SHUTDOWN_WAIT, |s| matches!(s, Slot::Starting { .. }));
                     None
                 }
                 Slot::Idle => None,
@@ -1102,6 +1156,9 @@ impl Daemon {
         }
     }
 }
+
+/// How long `shutdown` waits for a cancelled start to end.
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(12);
 
 /// A one-shot client: sends one request, returns the reply.
 pub fn request(socket: &Path, method: &str, params: Value) -> std::io::Result<Value> {
@@ -1161,14 +1218,19 @@ mod tests {
         error: Arc<Mutex<Option<String>>>,
         halted: Arc<AtomicUsize>,
         stopped: Arc<AtomicUsize>,
+        halt_takes: Duration,
     }
 
     impl Running for Fake {
         fn status(&self) -> Status {
             Status { recording: true, path: self.path.clone(), error: self.error.lock().unwrap().clone(), ..Status::default() }
         }
-        fn halt_capture(&mut self) {
-            self.halted.fetch_add(1, Ordering::SeqCst);
+        fn halt_handle(&self) -> Box<dyn FnOnce() + Send> {
+            let (halted, takes) = (self.halted.clone(), self.halt_takes);
+            Box::new(move || {
+                std::thread::sleep(takes);
+                halted.fetch_add(1, Ordering::SeqCst);
+            })
         }
         fn stop(self: Box<Self>) -> Result<(cast_mux::Summary, Status), String> {
             self.stopped.fetch_add(1, Ordering::SeqCst);
@@ -1328,6 +1390,96 @@ mod tests {
         let t = describe(&opts(json!({"source": {"kind": "area", "connector": "DP-1", "x": 1, "y": 2, "width": 30, "height": 40}})));
         assert!(t.contains("30×40") && t.contains("1,2") && !t.contains("Area {"), "{t}");
         assert!(describe(&opts(json!({"source": {"kind": "window", "id": 9}}))).contains(&trf("window {id}", &[("id", "9".into())])));
+    }
+
+    #[test]
+    fn a_panic_in_the_start_does_not_leave_the_daemon_starting_for_ever() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let d = Daemon::default().with_consent(Consent::Allow).with_starter(Arc::new(move |_, _| {
+            if c2.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("the encoder blew up");
+            }
+            Ok(Box::new(Fake { path: "/home/me/Videos/a.mp4".into(), ..Fake::default() }) as Box<dyn Running>)
+        }));
+        let r = call(&d, "record.start", start_params(Path::new("/home/me/Videos/a.mp4")));
+        assert_eq!(r["error"]["message"], tr("The start failed unexpectedly"), "{r}");
+        assert_eq!(call(&d, "record.status", json!({}))["result"], json!({"recording": false}));
+        let r = call(&d, "record.start", start_params(Path::new("/home/me/Videos/a.mp4")));
+        assert!(r.get("error").is_none(), "a new start is accepted: {r}");
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_cancelled_start_and_removes_the_empty_file_it_opened() {
+        let dir = scratch("shutdown");
+        let file = dir.join("a.mp4");
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let s2 = stopped.clone();
+        let d = Arc::new(Daemon::default().with_consent(Consent::Allow).with_starter(Arc::new(move |o, _| {
+            std::fs::write(&o.path, b"").unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            Ok(Box::new(Fake { path: o.path.display().to_string(), stopped: s2.clone(), ..Fake::default() }) as Box<dyn Running>)
+        })));
+        let d2 = d.clone();
+        let params = start_params(&file);
+        let h = std::thread::spawn(move || call(&d2, "record.start", params));
+        std::thread::sleep(Duration::from_millis(100));
+        d.shutdown();
+        assert_eq!(stopped.load(Ordering::SeqCst), 1, "shutdown returned before the start was finished");
+        assert!(!file.exists(), "the empty file the start opened is gone");
+        let r = h.join().unwrap();
+        assert_eq!(r["error"]["message"], tr("The start was cancelled"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn titles_go_only_to_the_secret_or_an_allowing_daemon() {
+        let list = || cast_capture::Sources {
+            monitors: vec![],
+            windows: vec![cast_capture::screencast::Window { id: 3, title: "Bank".into(), app_id: "firefox".into() }],
+        };
+        let shown = |consent: Consent, secret: Option<&str>| {
+            let d = Daemon::default().with_consent(consent).with_handler_secret(SECRET.into());
+            let params = secret.map_or(json!({}), |s| json!({"secret": s}));
+            d.filter_sources(&params, list()).windows[0].title == "Bank"
+        };
+        assert!(shown(Consent::Ask, Some(SECRET)));
+        assert!(!shown(Consent::Ask, None));
+        assert!(!shown(Consent::Ask, Some("wrong")));
+        assert!(shown(Consent::Allow, None));
+        assert!(shown(Consent::Allow, Some(SECRET)));
+    }
+
+    #[test]
+    fn status_answers_while_a_failed_recordings_capture_is_stopping() {
+        let halted = Arc::new(AtomicUsize::new(0));
+        let fake = Fake { path: "/x/a.mp4".into(), halted: halted.clone(), halt_takes: Duration::from_millis(600), ..Fake::default() };
+        let out: Arc<Mutex<Option<FailNotify>>> = Arc::default();
+        let (d, _log) = slow_daemon(Duration::ZERO, fake, out.clone());
+        let _ = call(&d, "record.start", start_params(Path::new("/x/a.mp4")));
+        (out.lock().unwrap().clone().unwrap())("disk full".into());
+        std::thread::sleep(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let st = call(&d, "record.status", json!({}));
+        assert!(t0.elapsed() < Duration::from_millis(100), "status waited {:?} for the capture to stop", t0.elapsed());
+        assert!(st.get("result").is_some());
+        let t0 = Instant::now();
+        let _ = call(&d, "record.stop", json!({}));
+        assert!(t0.elapsed() < Duration::from_millis(100), "stop waited {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn the_description_names_the_window_and_quotes_names_without_debug() {
+        let o = opts(json!({"source": {"kind": "window", "id": 3}}));
+        let t = describe_with(&o, Some(("org.mozilla.firefox", "Bank \"login\"\u{202e}")));
+        assert!(t.contains("org.mozilla.firefox") && t.contains("Bank \\\"login\\\"\\u{202e}"), "{t}");
+        assert!(!t.contains('\u{202e}'));
+        let mut o = opts(json!({}));
+        o.source = Source::Monitor { connector: "DP-1\u{1b}[31m".into() };
+        o.path = PathBuf::from("/tmp/a\nb/ç.mp4");
+        let t = describe(&o);
+        assert!(t.contains("\"DP-1\\u{1b}[31m\"") && t.contains("\"/tmp/a\\u{a}b\"") && t.contains("\"ç.mp4\""), "{t}");
+        assert!(!t.contains("\\n"), "{t}");
     }
 
     #[test]
@@ -1711,7 +1863,8 @@ mod tests {
         writeln!(c, "{long}").unwrap();
         assert_eq!(read_reply(&c)["error"]["code"], -32600);
         let mut rest = String::new();
-        assert_eq!(c.read_to_string(&mut rest).unwrap(), 0, "closed");
+        // closed: a clean end, or a reset when the server closes with the rest of the line unread
+        assert!(c.read_to_string(&mut rest).map_or_else(|e| e.kind() == std::io::ErrorKind::ConnectionReset, |n| n == 0), "closed");
         // a line that never ends is cut at the limit, not buffered
         let mut c = UnixStream::connect(&sock).unwrap();
         c.write_all(&[b'a'; 4096]).unwrap();

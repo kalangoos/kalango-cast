@@ -184,14 +184,37 @@ fn offer(tx: &SyncSender<MuxMsg>, msg: MuxMsg) -> bool {
 /// What the video thread tells the recorder once the encoder is up (or failed).
 type Opened = Result<(EncoderInfo, u32, u32), String>;
 
+/// The capture side (video, sound, the compositor's session), shareable so a failed recording's capture can be stopped
+/// from another thread without holding anything of the daemon.
+pub struct Capture {
+    video: Mutex<Option<VideoCapture>>,
+    audio: Mutex<Option<AudioCapture>>,
+    stream: Mutex<cast_capture::Stream>,
+    halted: std::sync::atomic::AtomicBool,
+}
+
+impl Capture {
+    /// Stops everything that captures. Safe to repeat and from any thread.
+    pub fn halt(&self) {
+        if let Some(v) = self.video.lock().ok().and_then(|mut v| v.take()) {
+            let _ = v.stop();
+        }
+        if let Some(a) = self.audio.lock().ok().and_then(|mut a| a.take()) {
+            a.stop();
+        }
+        if let Ok(s) = self.stream.lock() {
+            s.stop();
+        }
+        self.halted.store(true, Ordering::Release);
+    }
+}
+
 pub struct Recorder {
     options: RecordOptions,
     counters: Arc<Counters>,
-    video: Option<VideoCapture>,
-    audio: Option<AudioCapture>,
+    capture: Arc<Capture>,
     mux_tx: SyncSender<MuxMsg>,
     mux: Option<JoinHandle<Result<Summary, String>>>,
-    _stream: cast_capture::Stream,
     info: EncoderInfo,
     size: (u32, u32),
     audio_tracks: u32,
@@ -666,11 +689,14 @@ impl Recorder {
             audio_tracks: if audio.is_some() { targets.len() as u32 } else { 0 },
             options,
             counters,
-            video: Some(video),
-            audio,
+            capture: Arc::new(Capture {
+                video: Mutex::new(Some(video)),
+                audio: Mutex::new(audio),
+                stream: Mutex::new(stream),
+                halted: std::sync::atomic::AtomicBool::new(false),
+            }),
             mux_tx,
             mux: Some(mux),
-            _stream: stream,
             info,
             size: (w, h),
             cpu_start: stats::cpu_time_ns(),
@@ -688,7 +714,7 @@ impl Recorder {
         let disk_n = c.disk_samples.load(Ordering::Relaxed).max(1);
         let (gpu, enc) = self.nvml.as_ref().map(|n| n.sample()).unwrap_or((None, None));
         Status {
-            recording: self.video.is_some() && !c.failed.load(Ordering::Acquire),
+            recording: !self.capture.halted.load(Ordering::Acquire) && !c.failed.load(Ordering::Acquire),
             path: self.options.path.display().to_string(),
             encoder: self.info.kind.name().into(),
             codec: format!("{:?}", self.info.codec).to_lowercase(),
@@ -721,21 +747,14 @@ impl Recorder {
         }
     }
 
-    /// Stops the capture (video, sound, the compositor's session) and leaves the writer to `stop`: what a recording
-    /// that failed does, so nothing keeps running for a file that cannot be written. Safe to repeat.
-    pub fn halt_capture(&mut self) {
-        if let Some(v) = self.video.take() {
-            let _ = v.stop();
-        }
-        if let Some(a) = self.audio.take() {
-            a.stop();
-        }
-        self._stream.stop();
+    /// The capture side, to stop it from another thread (a recording that failed) without touching the recorder.
+    pub fn capture(&self) -> Arc<Capture> {
+        self.capture.clone()
     }
 
     /// Stops capturing, writes the last fragment and the index; returns what the file holds.
     pub fn stop(mut self) -> Result<(Summary, Status), String> {
-        self.halt_capture();
+        self.capture.halt();
         let status = Status { recording: false, ..self.status() };
         let _ = self.mux_tx.send(MuxMsg::Finish);
         let summary = self.mux.take().map(|m| m.join().unwrap_or_else(|_| Err("mux thread panicked".into()))).unwrap_or(Err(String::new()))?;
