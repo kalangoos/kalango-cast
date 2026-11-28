@@ -213,6 +213,8 @@ pub struct Recorder {
     options: RecordOptions,
     counters: Arc<Counters>,
     capture: Arc<Capture>,
+    /// A handle on the output file we opened (to remove it, by identity, when nothing was recorded).
+    output: Option<std::fs::File>,
     mux_tx: SyncSender<MuxMsg>,
     mux: Option<JoinHandle<Result<Summary, String>>>,
     info: EncoderInfo,
@@ -570,6 +572,12 @@ fn audio_outcome<T>(started: Result<T, cast_capture::CaptureError>) -> (Option<T
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the next `Recorder::start` on this thread panics after the file was opened.
+    static PANIC_IN_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Recorder {
     /// Starts recording; returns once the encoder is running (or with why it could not start).
     pub fn start(options: RecordOptions) -> Result<Recorder, String> {
@@ -597,15 +605,23 @@ impl Recorder {
             })
         })?;
         let path = options.path.clone();
-        Self::start_with_file(options, file, notify).map_err(StartError::environment).inspect_err(|_| {
-            // nothing was recorded: do not leave an empty file behind
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
-                let _ = std::fs::remove_file(&path);
+        let ours = file.try_clone().ok();
+        // a panic in the start (an encoder, a driver) is an error of the environment, and nothing is left behind
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Self::start_with_file(options, file, notify, ours.as_ref())))
+            .unwrap_or_else(|p| Err(format!("{}: {}", tr("The start failed unexpectedly"), cast_capture::guard::panic_text(&*p))));
+        started.map_err(StartError::environment).inspect_err(|_| {
+            // nothing was recorded: do not leave an empty file behind (ours, by identity: never another file of that name)
+            if let Some(f) = &ours {
+                cast_mux::remove_if_ours_and_empty(f, &path);
             }
         })
     }
 
-    fn start_with_file(options: RecordOptions, file: std::fs::File, notify: FailNotify) -> Result<Recorder, String> {
+    fn start_with_file(options: RecordOptions, file: std::fs::File, notify: FailNotify, ours: Option<&std::fs::File>) -> Result<Recorder, String> {
+        #[cfg(test)]
+        if PANIC_IN_START.with(|p| p.get()) {
+            panic!("injected panic in the start");
+        }
         let caps = cast_encode::probe();
         let kind = cast_encode::choose(&caps, options.encoder, options.codec).ok_or_else(|| {
             let why: Vec<String> = caps.iter().filter_map(|c| c.reason.as_ref().map(|r| format!("{}: {r}", c.kind.name()))).collect();
@@ -732,6 +748,7 @@ impl Recorder {
             audio_tracks: if audio.is_some() { targets.len() as u32 } else { 0 },
             options,
             counters,
+            output: ours.and_then(|f| f.try_clone().ok()),
             capture: Arc::new(Capture {
                 video: Mutex::new(Some(video)),
                 audio: Mutex::new(audio),
@@ -800,8 +817,14 @@ impl Recorder {
         self.capture.halt();
         let status = Status { recording: false, ..self.status() };
         let _ = self.mux_tx.send(MuxMsg::Finish);
-        let summary = self.mux.take().map(|m| m.join().unwrap_or_else(|_| Err("mux thread panicked".into()))).unwrap_or(Err(String::new()))?;
-        Ok((summary, status))
+        let summary = self.mux.take().map(|m| m.join().unwrap_or_else(|_| Err("mux thread panicked".into()))).unwrap_or(Err(String::new()));
+        if summary.is_err() {
+            // nothing usable was written: the empty file we opened does not stay behind
+            if let Some(f) = &self.output {
+                cast_mux::remove_if_ours_and_empty(f, &self.options.path);
+            }
+        }
+        Ok((summary?, status))
     }
 }
 
@@ -841,6 +864,37 @@ mod tests {
         (o.fps, o.bitrate_kbps) = (100_000, 8000);
         o.normalize();
         assert_eq!((o.fps, o.bitrate_kbps), (MAX_FPS, 8000));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kalango-cast-recorder-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_panic_in_the_start_leaves_no_empty_file_and_is_an_error() {
+        let dir = scratch("panic");
+        let path = dir.join("a.mp4");
+        PANIC_IN_START.with(|p| p.set(true));
+        let r = Recorder::start(RecordOptions::new(Source::Window { id: 1 }, path.clone()));
+        PANIC_IN_START.with(|p| p.set(false));
+        assert!(r.err().is_some_and(|e| e.contains("injected panic")));
+        assert!(!path.exists(), "the empty file open_output created was removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_start_never_removes_a_file_it_did_not_create() {
+        let dir = scratch("foreign");
+        let path = dir.join("a.mp4");
+        std::fs::write(&path, b"").unwrap();
+        // not ours (no overwrite): refused at the open, and the empty file that is there stays
+        let r = Recorder::start(RecordOptions::new(Source::Window { id: 1 }, path.clone()));
+        assert!(r.is_err());
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

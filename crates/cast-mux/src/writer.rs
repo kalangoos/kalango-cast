@@ -170,6 +170,17 @@ pub fn open_output(path: &Path, overwrite: bool) -> io::Result<File> {
     Ok(f)
 }
 
+/// Removes `path` if it is still the file `ours` (same device and inode, not a link) and it is empty: what a recording
+/// that never wrote anything leaves behind. A file someone else put at that name meanwhile, or a link, is not touched.
+/// Returns whether it was removed.
+pub fn remove_if_ours_and_empty(ours: &File, path: &Path) -> bool {
+    let (Ok(mine), Ok(there)) = (ours.metadata(), std::fs::symlink_metadata(path)) else { return false };
+    if !there.is_file() || there.dev() != mine.dev() || there.ino() != mine.ino() || there.len() != 0 || mine.len() != 0 {
+        return false;
+    }
+    std::fs::remove_file(path).is_ok()
+}
+
 pub struct Writer {
     file: File,
     end: u64,

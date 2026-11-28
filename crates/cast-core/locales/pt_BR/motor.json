@@ -31,6 +31,7 @@
   "The path must end in .mp4": "O caminho precisa terminar em .mp4",
   "The path must not contain ..": "O caminho não pode conter ..",
   "The screencast sent no frames": "A captura de tela não enviou quadros",
+  "The service is shutting down": "O serviço está encerrando",
   "The start failed unexpectedly": "O início falhou de forma inesperada",
   "The start was cancelled": "O início foi cancelado",
   "Too many connections": "Conexões demais",

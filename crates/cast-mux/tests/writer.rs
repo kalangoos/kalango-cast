@@ -5,7 +5,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use cast_core::VideoCodec;
-use cast_mux::{avc, open_output, Config, VideoTrack, Writer};
+use cast_mux::{avc, open_output, remove_if_ours_and_empty, Config, VideoTrack, Writer};
 
 const PARAMS: &[u8] =
     &[0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0x84, 0, 0, 0, 1, 0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0];
@@ -170,4 +170,32 @@ fn the_folder_must_be_a_real_folder_of_ours() {
         assert!(e.to_string().contains("not yours"), "{e}");
         assert!(!Path::new("/usr/kalango-cast-test.mp4").exists());
     }
+}
+
+#[test]
+fn an_empty_output_is_removed_by_identity_not_by_name() {
+    let dir = scratch("identity");
+    let p = dir.join("a.mp4");
+    // ours and empty: removed
+    let f = open_output(&p, false).unwrap();
+    assert!(remove_if_ours_and_empty(&f, &p));
+    assert!(!p.exists());
+    // the name was taken by someone else's file meanwhile (ours was unlinked): theirs stays
+    let f = open_output(&p, false).unwrap();
+    std::fs::remove_file(&p).unwrap();
+    std::fs::write(&p, b"").unwrap();
+    assert!(!remove_if_ours_and_empty(&f, &p), "a different empty file at the same name is not ours");
+    assert!(p.exists());
+    // a link at the name is never followed
+    let f = open_output(&dir.join("b.mp4"), false).unwrap();
+    std::fs::remove_file(dir.join("b.mp4")).unwrap();
+    symlink(&p, dir.join("b.mp4")).unwrap();
+    assert!(!remove_if_ours_and_empty(&f, &dir.join("b.mp4")));
+    assert!(p.exists());
+    // a file with content (an overwritten recording that got data) is kept
+    let q = dir.join("c.mp4");
+    let mut f = open_output(&q, false).unwrap();
+    std::io::Write::write_all(&mut f, b"data").unwrap();
+    assert!(!remove_if_ours_and_empty(&f, &q));
+    assert!(q.exists());
 }

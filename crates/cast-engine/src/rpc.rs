@@ -356,6 +356,8 @@ struct Core {
     hook: Option<Hook>,
     ttl: Duration,
     next_id: AtomicU64,
+    /// The daemon is exiting: no new recording starts.
+    shutting_down: AtomicBool,
     /// Signalled when a start ends (a shutdown waits on it).
     changed: std::sync::Condvar,
 }
@@ -368,6 +370,7 @@ impl Default for Core {
             hook: None,
             ttl: CONSENT_TTL,
             next_id: AtomicU64::new(0),
+            shutting_down: AtomicBool::new(false),
             changed: std::sync::Condvar::new(),
         }
     }
@@ -969,6 +972,10 @@ impl Daemon {
                 // the slow part (the compositor, the encoder, up to 10 s) runs with no lock held
                 let (id, cancel) = {
                     let mut slot = lock(&self.core.slot);
+                    // checked under the slot's lock, the same one `shutdown` takes: a start cannot slip in after it
+                    if self.core.shutting_down.load(Ordering::Acquire) {
+                        return Err(app(tr("The service is shutting down").into()));
+                    }
                     if !matches!(*slot, Slot::Idle) {
                         drop(slot);
                         let _ = (fp, what, used);
@@ -1001,10 +1008,6 @@ impl Daemon {
                         *slot = Slot::Idle;
                         drop(slot);
                         let _ = rec.stop();
-                        // the file the cancelled start opened is not left behind empty
-                        if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
-                            let _ = std::fs::remove_file(&path);
-                        }
                         Err(app(tr("The start was cancelled").into()))
                     }
                     Ok(rec) => {
@@ -1149,6 +1152,7 @@ impl Daemon {
     pub fn shutdown(&self) {
         let rec = {
             let mut slot = lock(&self.core.slot);
+            self.core.shutting_down.store(true, Ordering::Release);
             match std::mem::take(&mut *slot) {
                 Slot::Running { rec, .. } => Some(rec),
                 s @ Slot::Starting { .. } => {
@@ -1421,13 +1425,12 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_waits_for_a_cancelled_start_and_removes_the_empty_file_it_opened() {
+    fn shutdown_waits_for_a_cancelled_start() {
         let dir = scratch("shutdown");
         let file = dir.join("a.mp4");
         let stopped = Arc::new(AtomicUsize::new(0));
         let s2 = stopped.clone();
         let d = Arc::new(Daemon::default().with_consent(Consent::Allow).with_starter(Arc::new(move |o, _| {
-            std::fs::write(&o.path, b"").unwrap();
             std::thread::sleep(Duration::from_millis(400));
             Ok(Box::new(Fake { path: o.path.display().to_string(), stopped: s2.clone(), ..Fake::default() }) as Box<dyn Running>)
         })));
@@ -1437,7 +1440,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         d.shutdown();
         assert_eq!(stopped.load(Ordering::SeqCst), 1, "shutdown returned before the start was finished");
-        assert!(!file.exists(), "the empty file the start opened is gone");
         let r = h.join().unwrap();
         assert_eq!(r["error"]["message"], tr("The start was cancelled"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1593,6 +1595,21 @@ mod tests {
         let mut c = UnixStream::connect(&sock).unwrap();
         writeln!(c, r#"{{"jsonrpc":"2.0","id":1,"method":"record.status"}}"#).unwrap();
         assert_eq!(read_reply(&c)["result"]["recording"], false);
+    }
+
+    #[test]
+    fn no_recording_starts_after_shutdown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let d = Daemon::default().with_consent(Consent::Allow).with_starter(Arc::new(move |_, _| {
+            c2.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Fake { path: "/x/a.mp4".into(), ..Fake::default() }) as Box<dyn Running>)
+        }));
+        d.shutdown();
+        let r = call(&d, "record.start", start_params(Path::new("/x/a.mp4")));
+        assert_eq!(r["error"]["message"], tr("The service is shutting down"), "{r}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing was opened");
+        assert_eq!(call(&d, "record.status", json!({}))["result"]["recording"], false);
     }
 
     #[test]
