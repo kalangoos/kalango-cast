@@ -3,6 +3,7 @@
 
 pub mod clock;
 pub mod i18n;
+pub mod text;
 pub mod types;
 
 pub use clock::{monotonic_ns, AudioTimeline, MediaClock, Placement};

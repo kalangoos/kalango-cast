@@ -894,8 +894,7 @@ impl App {
                 keys.push(SourceKey::Monitor(mon.connector.clone()));
             }
             for win in &m.sources.windows {
-                let title = if win.title.is_empty() { tr("(untitled window)").to_string() } else { win.title.clone() };
-                let sub = if win.app_id.is_empty() { tr("Window").to_string() } else { trf("Window · {app}", &[("app", win.app_id.clone())]) };
+                let (title, sub) = crate::model::window_row(win);
                 add_source_row(&w.sources_list, &format!("w:{}", win.id), &title, &sub);
                 keys.push(SourceKey::Window(win.id));
             }

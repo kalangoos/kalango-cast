@@ -613,6 +613,15 @@ impl Model {
     }
 }
 
+/// The two lines of a window's row in the source list: the compositor's words, shown without anything that could
+/// hide or reorder text.
+pub fn window_row(win: &WindowInfo) -> (String, String) {
+    let (title, app) = (cast_core::text::escape_unsafe(&win.title), cast_core::text::escape_unsafe(&win.app_id));
+    let title = if title.is_empty() { tr("(untitled window)").to_string() } else { title };
+    let sub = if app.is_empty() { tr("Window").to_string() } else { trf("Window · {app}", &[("app", app)]) };
+    (title, sub)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +847,15 @@ mod tests {
         assert_eq!(m.capture, CaptureState::Unavailable("no screencast".into()));
         m.update(Msg::Sources(Ok(SourceList::default())));
         assert!(m.can_start());
+    }
+
+    #[test]
+    fn a_window_title_cannot_hide_text_in_the_list() {
+        let w = WindowInfo { id: 1, title: "Pay\u{E0041}\u{061C}ment".into(), app_id: "app\u{202E}".into() };
+        let (title, sub) = window_row(&w);
+        assert_eq!(title, "Pay\\u{e0041}\\u{61c}ment");
+        assert!(sub.contains("app\\u{202e}"), "{sub}");
+        assert!(!title.chars().chain(sub.chars()).any(cast_core::text::is_unsafe_char));
     }
 
     #[test]

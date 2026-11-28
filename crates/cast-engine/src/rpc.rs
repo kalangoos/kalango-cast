@@ -580,11 +580,7 @@ fn audio_choice(v: Option<&Value>) -> Option<AudioChoice> {
     }
 }
 
-/// A character that could fake or hide text on the trusted channel (the terminal where the person approves):
-/// controls (C0, DEL, C1), line/paragraph separators, zero-width and bidirectional formatting characters.
-fn is_unsafe_char(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{200B}'..='\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
-}
+use cast_core::text::is_unsafe_char;
 
 /// Rejects a client-supplied string that holds such characters.
 fn plain(what: &str, s: &str) -> Result<(), RpcError> {
@@ -1610,6 +1606,15 @@ mod tests {
         assert_eq!(r["error"]["message"], tr("The service is shutting down"), "{r}");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing was opened");
         assert_eq!(call(&d, "record.status", json!({}))["result"]["recording"], false);
+    }
+
+    #[test]
+    fn text_that_hides_other_text_is_refused_and_quoted_away() {
+        for hidden in ["a\u{061C}b", "a\u{2060}b", "a\u{00AD}b", "a\u{034F}b", "a\u{3164}b", "a\u{E0041}b", "a\u{2063}b"] {
+            assert!(plain("x", hidden).is_err(), "{hidden:?}");
+            assert!(!quote(hidden).chars().any(is_unsafe_char), "{hidden:?}");
+        }
+        assert!(plain("x", "Café 日本").is_ok());
     }
 
     #[test]
