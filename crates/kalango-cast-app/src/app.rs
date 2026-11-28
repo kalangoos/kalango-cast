@@ -1039,7 +1039,7 @@ impl App {
         body.append(&label(intro, &["dim"]));
         // the service's own words, escaped by the service; shown as plain text (no markup), never edited here
         let what_label = gtk::Label::builder()
-            .label(what)
+            .label(crate::model::clip_what(what))
             .selectable(false)
             .use_markup(false)
             .wrap(true)
@@ -1048,7 +1048,15 @@ impl App {
             .halign(gtk::Align::Fill)
             .css_classes(["what", "mono"])
             .build();
-        body.append(&what_label);
+        // a tall text scrolls inside its own box: the buttons below stay on the screen whatever the service sent
+        let what_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .max_content_height(280)
+            .child(&what_label)
+            .build();
+        body.append(&what_scroll);
         let countdown = label("", &["dim"]);
         body.append(&countdown);
         body.append(&label(tr("While recording, this window shows a red dot and a timer at the top. Nothing is recorded if you deny."), &["warn"]));

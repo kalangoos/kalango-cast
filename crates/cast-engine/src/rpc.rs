@@ -595,6 +595,20 @@ use cast_core::text::is_unsafe_char;
 
 /// Rejects a client-supplied string that holds such characters.
 fn plain(what: &str, s: &str) -> Result<(), RpcError> {
+    plain_max(what, s, MAX_NAME_CHARS)
+}
+
+/// The longest name a request may carry (a monitor, a sound device): longer is refused, not cut.
+const MAX_NAME_CHARS: usize = 256;
+/// The longest path (Linux's PATH_MAX).
+const MAX_PATH_CHARS: usize = 4096;
+/// How much of any one field the approval text shows; the rest is counted, not shown.
+const SHOW_CHARS: usize = 200;
+
+fn plain_max(what: &str, s: &str, max: usize) -> Result<(), RpcError> {
+    if s.chars().nth(max).is_some() {
+        return Err((-32602, format!("{what}: {}", trf("longer than {n} characters", &[("n", max.to_string())]))));
+    }
     if s.chars().any(is_unsafe_char) {
         return Err((-32602, format!("{what}: {}", tr("control or invisible characters are not allowed"))));
     }
@@ -606,7 +620,7 @@ pub fn parse_start(params: &Value) -> Result<RecordOptions, RpcError> {
     let bad = |m: String| (-32602, m);
     let source: Source = serde_json::from_value(params.get("source").cloned().unwrap_or(Value::Null)).map_err(|e| bad(format!("source: {e}")))?;
     let path_text = params.get("path").and_then(|p| p.as_str()).ok_or_else(|| bad("path".into()))?;
-    plain("path", path_text)?;
+    plain_max("path", path_text, MAX_PATH_CHARS)?;
     if let Source::Monitor { connector } | Source::Area { connector, .. } = &source {
         plain("source", connector)?;
     }
@@ -695,11 +709,23 @@ fn quote(s: &str) -> String {
     out
 }
 
+/// [`quote`] for the approval text: at most [`SHOW_CHARS`] characters of it, then how long it really is, so a huge
+/// value cannot push the rest of the text off the screen.
+fn quote_short(s: &str) -> String {
+    let total = s.chars().count();
+    if total <= SHOW_CHARS {
+        return quote(s);
+    }
+    let head: String = s.chars().take(SHOW_CHARS).collect();
+    let q = quote(&head);
+    format!("{}…\" {}", &q[..q.len() - 1], trf("({n} characters in all)", &[("n", total.to_string())]))
+}
+
 fn audio_text(c: &Option<AudioChoice>) -> String {
     match c {
         None | Some(AudioChoice::Off) => tr("off").into(),
         Some(AudioChoice::Default) => tr("default device").into(),
-        Some(AudioChoice::Named(n)) => quote(n),
+        Some(AudioChoice::Named(n)) => quote_short(n),
     }
 }
 
@@ -719,14 +745,22 @@ fn describe_with(o: &RecordOptions, window: Option<(&str, &str)>) -> String {
         (false, false) => tr("new file"),
     };
     let source = match &o.source {
-        Source::Monitor { connector } => trf("monitor {name}", &[("name", quote(connector))]),
+        Source::Monitor { connector } => trf("monitor {name}", &[("name", quote_short(connector))]),
         Source::Window { id } => match window {
-            Some((app, title)) => trf("window {id} ({app}: {title})", &[("id", id.to_string()), ("app", quote(app)), ("title", quote(title))]),
+            Some((app, title)) => {
+                trf("window {id} ({app}: {title})", &[("id", id.to_string()), ("app", quote_short(app)), ("title", quote_short(title))])
+            }
             None => trf("window {id}", &[("id", id.to_string())]),
         },
         Source::Area { connector, x, y, width, height } => trf(
             "area {width}×{height} at {x},{y} of monitor {name}",
-            &[("width", width.to_string()), ("height", height.to_string()), ("x", x.to_string()), ("y", y.to_string()), ("name", quote(connector))],
+            &[
+                ("width", width.to_string()),
+                ("height", height.to_string()),
+                ("x", x.to_string()),
+                ("y", y.to_string()),
+                ("name", quote_short(connector)),
+            ],
         ),
     };
     let codec = match o.codec {
@@ -744,16 +778,17 @@ fn describe_with(o: &RecordOptions, window: Option<(&str, &str)>) -> String {
             ("cursor", if o.cursor { tr("shown") } else { tr("hidden") }.to_string()),
         ],
     );
-    let folder = quote(&o.path.parent().unwrap_or(Path::new("/")).to_string_lossy());
-    let file = quote(&o.path.file_name().unwrap_or_default().to_string_lossy());
+    let folder = quote_short(&o.path.parent().unwrap_or(Path::new("/")).to_string_lossy());
+    let file = quote_short(&o.path.file_name().unwrap_or_default().to_string_lossy());
     [
+        // what decides the approval comes first (the mode and the file), then the free text that is cut to fit
+        (tr("Mode"), mode.to_string()),
+        (tr("File"), file),
+        (tr("Folder"), folder),
         (tr("Source"), source),
         (tr("Desktop sound"), audio_text(&o.desktop_audio)),
         (tr("Microphone"), audio_text(&o.mic)),
         (tr("Video"), video),
-        (tr("Mode"), mode.to_string()),
-        (tr("Folder"), folder),
-        (tr("File"), file),
     ]
     .iter()
     .map(|(label, value)| format!("{label}: {value}"))
@@ -1651,6 +1686,33 @@ mod tests {
     }
 
     #[test]
+    fn a_megabyte_of_text_cannot_push_the_decision_off_the_screen() {
+        let huge = "x".repeat(1 << 20);
+        // refused at the door: names and paths have limits
+        for field in [json!({"source": {"kind": "monitor", "connector": huge}}), json!({"mic": huge}), json!({"desktop_audio": huge})] {
+            let mut v = start_params(Path::new("/home/me/Videos/a.mp4"));
+            for (k, val) in field.as_object().unwrap() {
+                v[k] = val.clone();
+            }
+            assert_eq!(parse_start(&v).unwrap_err().0, -32602);
+        }
+        let mut v = start_params(Path::new("/home/me/Videos/a.mp4"));
+        v["path"] = json!(format!("/home/me/{huge}.mp4"));
+        assert_eq!(parse_start(&v).unwrap_err().0, -32602);
+        // and whatever got past (a title from the compositor) is cut to a few lines of bounded length
+        let mut o = opts(json!({"source": {"kind": "window", "id": 3}}));
+        o.mic = Some(AudioChoice::Named(huge.clone()));
+        let text = describe_with(&o, Some((&huge, &huge)));
+        assert!(text.len() < 4096, "{} bytes", text.len());
+        let mode = text.lines().next().unwrap();
+        assert!(mode.starts_with(&format!("{}: ", tr("Mode"))));
+        let file_at = text.find(&format!("{}: ", tr("File"))).unwrap();
+        assert!(file_at < 200, "the file is shown at byte {file_at}");
+        assert!(text.contains("1048576"), "the real size is said");
+        assert_eq!(text.lines().count(), 7);
+    }
+
+    #[test]
     fn errors_follow_json_rpc() {
         let d = Daemon::default();
         let r = d.handle(r#"{"jsonrpc":"2.0","id":3,"method":"nope"}"#).unwrap();
@@ -1759,8 +1821,8 @@ mod tests {
         let text = describe(&o);
         assert!(!text.chars().any(|c| is_unsafe_char(c) && c != '\n'), "{text:?}");
         assert_eq!(text.lines().count(), 7, "one line per fact, the client's text cannot add lines: {text:?}");
-        assert!(text.lines().last().unwrap().starts_with(&format!("{}: ", tr("File"))));
-        assert!(text.lines().next().unwrap().starts_with(&format!("{}: ", tr("Source"))));
+        assert!(text.lines().nth(1).unwrap().starts_with(&format!("{}: ", tr("File"))));
+        assert!(text.lines().next().unwrap().starts_with(&format!("{}: ", tr("Mode"))));
     }
 
     #[test]

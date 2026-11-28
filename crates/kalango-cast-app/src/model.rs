@@ -613,6 +613,20 @@ impl Model {
     }
 }
 
+/// The most of the service's approval text the dialog will lay out (the service cuts every field itself; this is the
+/// window not trusting that, for a daemon that is not ours).
+pub const MAX_WHAT_CHARS: usize = 4000;
+
+/// `what`, cut to [`MAX_WHAT_CHARS`] with a mark when it was cut.
+pub fn clip_what(what: &str) -> String {
+    if what.chars().nth(MAX_WHAT_CHARS).is_none() {
+        return what.to_string();
+    }
+    let mut out: String = what.chars().take(MAX_WHAT_CHARS).collect();
+    out.push('…');
+    out
+}
+
 /// The two lines of a window's row in the source list: the compositor's words, shown without anything that could
 /// hide or reorder text.
 pub fn window_row(win: &WindowInfo) -> (String, String) {
@@ -847,6 +861,14 @@ mod tests {
         assert_eq!(m.capture, CaptureState::Unavailable("no screencast".into()));
         m.update(Msg::Sources(Ok(SourceList::default())));
         assert!(m.can_start());
+    }
+
+    #[test]
+    fn the_approval_text_is_cut_to_what_fits_on_a_screen() {
+        let huge = format!("Mode: x\nFile: {}", "y".repeat(1 << 20));
+        let c = clip_what(&huge);
+        assert!(c.chars().count() <= MAX_WHAT_CHARS + 1 && c.starts_with("Mode: x"));
+        assert_eq!(clip_what("short"), "short");
     }
 
     #[test]

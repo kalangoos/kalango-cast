@@ -1,4 +1,5 @@
 {
+  "({n} characters in all)": "({n} caracteres no total)",
   "A consent handler is already registered": "Já existe quem trate o consentimento",
   "A handler must be a socket connection": "Quem trata o consentimento precisa ser uma conexão do socket",
   "A recording is already running": "Já há uma gravação em andamento",
@@ -45,6 +46,7 @@
   "exists and is not a socket: not removing it": "existe e não é um socket: não vou apagar",
   "hidden": "oculto",
   "kalango-castd is already running": "o kalango-castd já está rodando",
+  "longer than {n} characters": "mais longo que {n} caracteres",
   "monitor {name}": "monitor {name}",
   "new file": "arquivo novo",
   "new file (overwrite allowed, nothing there now)": "arquivo novo (substituir permitido, não há nada ali agora)",
