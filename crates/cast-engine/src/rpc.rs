@@ -1483,6 +1483,33 @@ mod tests {
     }
 
     #[test]
+    fn a_panic_in_the_capture_is_a_failed_recording_and_the_daemon_carries_on() {
+        let halted = Arc::new(AtomicUsize::new(0));
+        let error = Arc::new(Mutex::new(None));
+        let fake = Fake { path: "/x/a.mp4".into(), halted: halted.clone(), error: error.clone(), ..Fake::default() };
+        let out: Arc<Mutex<Option<FailNotify>>> = Arc::default();
+        let (d, log) = slow_daemon(Duration::ZERO, fake, out.clone());
+        assert!(call(&d, "record.start", start_params(Path::new("/x/a.mp4"))).get("error").is_none());
+        // what the recorder reports when a capture callback panicked
+        let why = format!("{}: encoder exploded", tr("The capture crashed"));
+        *error.lock().unwrap() = Some(why.clone());
+        (out.lock().unwrap().clone().unwrap())(why.clone());
+        assert!(log.lock().unwrap().iter().any(|e| matches!(e, Event::RecordingFailed { error, .. } if *error == why)));
+        let end = Instant::now() + Duration::from_secs(5);
+        while halted.load(Ordering::SeqCst) == 0 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(halted.load(Ordering::SeqCst), 1);
+        // the daemon answers and takes a new recording
+        assert!(call(&d, "record.status", json!({})).get("result").is_some());
+        let again = call(&d, "record.start", start_params(Path::new("/x/b.mp4")));
+        assert!(
+            again["error"]["message"].as_str().is_some_and(|m| m == "no encoder"),
+            "the failed one was discarded and the starter ran again: {again}"
+        );
+    }
+
+    #[test]
     fn errors_follow_json_rpc() {
         let d = Daemon::default();
         let r = d.handle(r#"{"jsonrpc":"2.0","id":3,"method":"nope"}"#).unwrap();

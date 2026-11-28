@@ -239,6 +239,7 @@ struct VideoState {
     counters: Arc<Counters>,
     opened: Option<Sender<Opened>>,
     error: Arc<Mutex<Option<String>>>,
+    notify: FailNotify,
     last_key_pts: Option<u64>,
 }
 
@@ -332,6 +333,10 @@ impl VideoSink for VideoState {
     fn skipped(&mut self) {
         self.counters.dropped.fetch_add(1, Ordering::Relaxed);
     }
+
+    fn failed(&mut self, why: &str) {
+        fail_capture(why, &self.counters, &self.error, &*self.notify);
+    }
 }
 
 struct AudioTrackState {
@@ -349,6 +354,8 @@ struct AudioState {
     pool: Pool,
     mux: SyncSender<MuxMsg>,
     counters: Arc<Counters>,
+    error: Arc<Mutex<Option<String>>>,
+    notify: FailNotify,
 }
 
 impl AudioState {
@@ -381,10 +388,25 @@ impl AudioState {
     }
 }
 
+/// A capture callback or thread panicked: the recording is over (said now, with why), the capture threads see
+/// `failed` and stop, and the daemon is not taken down with it.
+fn fail_capture(why: &str, counters: &Counters, error: &Mutex<Option<String>>, notify: &dyn Fn(String)) {
+    let text = format!("{}: {why}", tr("The capture crashed"));
+    counters.failed.store(true, Ordering::Release);
+    if let Ok(mut slot) = error.lock() {
+        slot.get_or_insert_with(|| text.clone());
+    }
+    notify(text);
+}
+
 /// Zeros for inserted silence (one 20 ms stereo frame).
 static SILENCE: [f32; FRAME_SAMPLES * 2] = [0.0; FRAME_SAMPLES * 2];
 
 impl AudioSink for AudioState {
+    fn failed(&mut self, why: &str) {
+        fail_capture(why, &self.counters, &self.error, &*self.notify);
+    }
+
     fn samples(&mut self, index: usize, pcm: &[f32], frames: usize, first_ns: i64) {
         if self.counters.failed.load(Ordering::Acquire) {
             return;
@@ -620,10 +642,22 @@ impl Recorder {
         let (audio_pool, recycle_audio) = Pool::new(2 << 10);
         let c2 = counters.clone();
         let e2 = error.clone();
+        let mux_notify = notify.clone();
+        let vnotify = notify.clone();
         let open: Opener = Box::new(move |config| Writer::from_file(file, config));
         let mux = std::thread::Builder::new()
             .name("cast-mux".into())
-            .spawn(move || mux_thread(open, audio_tracks, mux_rx, recycle_video, recycle_audio, c2, e2, notify))
+            .spawn(move || {
+                let (c3, e3, n3) = (c2.clone(), e2.clone(), mux_notify);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    mux_thread(open, audio_tracks, mux_rx, recycle_video, recycle_audio, c2, e2, n3.clone())
+                }))
+                .unwrap_or_else(|p| {
+                    let why = cast_capture::guard::panic_text(&*p);
+                    fail_capture(&why, &c3, &e3, &*n3);
+                    Err(format!("{}: {why}", tr("The capture crashed")))
+                })
+            })
             .map_err(|e| e.to_string())?;
 
         let (opened_tx, opened_rx) = mpsc::channel::<Opened>();
@@ -652,6 +686,7 @@ impl Recorder {
                 counters: vcounters,
                 opened: Some(opened_tx),
                 error: verror,
+                notify: vnotify,
                 last_key_pts: None,
             };
             Ok((Box::new(st) as Box<dyn VideoSink>, modifiers))
@@ -678,7 +713,15 @@ impl Recorder {
         let (audio, audio_error) = if targets.is_empty() {
             (None, None)
         } else {
-            let state = AudioState { clock, tracks: audio_states, pool: audio_pool, mux: mux_tx.clone(), counters: counters.clone() };
+            let state = AudioState {
+                clock,
+                tracks: audio_states,
+                pool: audio_pool,
+                mux: mux_tx.clone(),
+                counters: counters.clone(),
+                error: error.clone(),
+                notify: notify.clone(),
+            };
             let (audio, why) = audio_outcome(AudioCapture::start(targets.iter().map(|(t, _)| t.clone()).collect(), Box::new(state)));
             if let Some(why) = &why {
                 eprintln!("{why}");
@@ -798,6 +841,18 @@ mod tests {
         (o.fps, o.bitrate_kbps) = (100_000, 8000);
         o.normalize();
         assert_eq!((o.fps, o.bitrate_kbps), (MAX_FPS, 8000));
+    }
+
+    #[test]
+    fn a_panic_in_a_capture_callback_ends_the_recording_visibly() {
+        let counters = Counters::default();
+        let error = Mutex::new(None);
+        let told = Mutex::new(Vec::new());
+        fail_capture("encoder exploded", &counters, &error, &|e| told.lock().unwrap().push(e));
+        assert!(counters.failed.load(Ordering::Acquire), "the capture threads stop");
+        let text = error.lock().unwrap().clone().unwrap();
+        assert!(text.contains("encoder exploded") && text.starts_with(tr("The capture crashed")), "{text}");
+        assert_eq!(*told.lock().unwrap(), vec![text]);
     }
 
     #[test]

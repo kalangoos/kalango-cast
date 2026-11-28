@@ -22,6 +22,7 @@
   "Recording requested: {what}. To allow it, run: kalango-cast approve {token}": "Gravação pedida: {what}. Para permitir, rode: kalango-cast approve {token}",
   "Request too long": "Pedido longo demais",
   "Source": "Fonte",
+  "The capture crashed": "A captura travou",
   "The consent handler could not be authenticated": "Não foi possível autenticar quem trata o consentimento",
   "The encoder gave no parameter sets": "O codificador não entregou os conjuntos de parâmetros",
   "The file already exists": "O arquivo já existe",

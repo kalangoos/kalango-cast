@@ -16,6 +16,7 @@ use spa::pod::serialize::PodSerializer;
 use spa::pod::{Pod, Value};
 use spa::utils::{Direction, SpaTypes};
 
+use crate::guard::Guarded;
 use crate::CaptureError;
 
 pub const RATE: u32 = 48_000;
@@ -34,6 +35,14 @@ pub trait AudioSink: Send {
     /// `pcm`: `frames` × [`CHANNELS`] interleaved samples of stream `index`, the first one captured at `first_ns`
     /// (monotonic).
     fn samples(&mut self, index: usize, pcm: &[f32], frames: usize, first_ns: i64);
+    /// A callback panicked (in this sink or below it): the capture stops and nothing else reaches the sink.
+    fn failed(&mut self, _why: &str) {}
+}
+
+impl crate::guard::Failing for Box<dyn AudioSink> {
+    fn failed(&mut self, why: &str) {
+        AudioSink::failed(&mut **self, why);
+    }
 }
 
 pub struct AudioCapture {
@@ -48,7 +57,10 @@ impl AudioCapture {
         let thread = std::thread::Builder::new()
             .name("cast-audio".into())
             .spawn(move || {
-                if let Err(e) = run(targets, sink, quit_rx, &ready_tx) {
+                // a panic anywhere in the thread is an error of the capture, never an unwind into nothing
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(targets, sink, quit_rx, &ready_tx)))
+                    .unwrap_or_else(|p| Err(CaptureError(format!("audio thread panicked: {}", crate::guard::panic_text(&*p)))));
+                if let Err(e) = r {
                     let _ = ready_tx.send(Err(e));
                 }
             })
@@ -83,7 +95,8 @@ impl Drop for AudioCapture {
 
 struct StreamData {
     index: usize,
-    sink: Rc<RefCell<Box<dyn AudioSink>>>,
+    sink: Rc<RefCell<Guarded<Box<dyn AudioSink>>>>,
+    quit: Rc<dyn Fn()>,
 }
 
 fn format_pod() -> Vec<u8> {
@@ -111,7 +124,11 @@ fn run(
     let core = context.connect_rc(None)?;
     let ml = mainloop.clone();
     let _quit = quit.attach(mainloop.loop_(), move |_| ml.quit());
-    let sink = Rc::new(RefCell::new(sink));
+    let sink = Rc::new(RefCell::new(Guarded::new(sink)));
+    let quit_loop: Rc<dyn Fn()> = {
+        let ml = mainloop.clone();
+        Rc::new(move || ml.quit())
+    };
     let pod = format_pod();
     let mut streams = Vec::new();
     for (index, target) in targets.into_iter().enumerate() {
@@ -134,7 +151,7 @@ fn run(
         }
         let stream = pw::stream::StreamBox::new(&core, name, props)?;
         let listener = stream
-            .add_local_listener_with_user_data(StreamData { index, sink: sink.clone() })
+            .add_local_listener_with_user_data(StreamData { index, sink: sink.clone(), quit: quit_loop.clone() })
             .process(|stream, data| {
                 // SAFETY: null or a buffer owned by us until queued back below.
                 let buf = unsafe { stream.dequeue_raw_buffer() };
@@ -205,7 +222,9 @@ unsafe fn deliver(data: &mut StreamData, buf: *mut pw::sys::pw_buffer, t: &pw::s
     // SAFETY: MAP_BUFFERS mapped maxsize bytes at data; offset + size stay inside; F32 samples are 4-byte aligned.
     let pcm = unsafe { std::slice::from_raw_parts((d.data as *const u8).add(offset) as *const f32, frames * CHANNELS) };
     let first = first_sample_ns(t.now, t.delay, t.rate.num, t.rate.denom, frames);
-    data.sink.borrow_mut().samples(data.index, pcm, frames, first);
+    let index = data.index;
+    let quit = data.quit.clone();
+    data.sink.borrow_mut().call(&*quit, |sink| sink.samples(index, pcm, frames, first));
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ use spa::pod::serialize::PodSerializer;
 use spa::pod::{ChoiceValue, Pod, Property, PropertyFlags, Value};
 use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle, SpaTypes};
 
+use crate::guard::Guarded;
 use crate::CaptureError;
 
 /// The negotiated stream format.
@@ -41,6 +42,14 @@ pub trait VideoSink {
     fn frame(&mut self, frame: &VideoFrame, received_ns: u64);
     /// A frame the compositor sent empty or marked corrupted, or that came while the sink was busy.
     fn skipped(&mut self) {}
+    /// A callback panicked (in this sink or below it): the capture stops and nothing else reaches the sink.
+    fn failed(&mut self, _why: &str) {}
+}
+
+impl crate::guard::Failing for Box<dyn VideoSink> {
+    fn failed(&mut self, why: &str) {
+        VideoSink::failed(&mut **self, why);
+    }
 }
 
 /// Counters readable from any thread.
@@ -71,7 +80,11 @@ impl VideoCapture {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), CaptureError>>();
         let thread = std::thread::Builder::new()
             .name("cast-video".into())
-            .spawn(move || run(node_id, make_sink, quit_rx, c2, ready_tx))
+            .spawn(move || {
+                // a panic anywhere in the thread ends the capture with an error instead of unwinding into nothing
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(node_id, make_sink, quit_rx, c2, ready_tx)))
+                    .unwrap_or_else(|p| Err(CaptureError(format!("video thread panicked: {}", crate::guard::panic_text(&*p)))))
+            })
             .map_err(|e| CaptureError(e.to_string()))?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(VideoCapture { quit: quit_tx, thread: Some(thread), counters }),
@@ -174,7 +187,11 @@ fn meta_header_pod() -> Vec<u8> {
 }
 
 struct State {
-    sink: Box<dyn VideoSink>,
+    sink: Guarded<Box<dyn VideoSink>>,
+    inner: Inner,
+}
+
+struct Inner {
     format: Option<StreamFormat>,
     counters: Arc<VideoCounters>,
     planes: Vec<DmaBufPlane>,
@@ -235,10 +252,15 @@ where
         Ok(s) => s,
         Err(e) => return fail(e.into()),
     };
-    let state = State { sink, format: None, counters, planes: Vec::with_capacity(4) };
+    let state = State { sink: Guarded::new(sink), inner: Inner { format: None, counters, planes: Vec::with_capacity(4) } };
+    let quit_loop: std::rc::Rc<dyn Fn()> = {
+        let ml = mainloop.clone();
+        std::rc::Rc::new(move || ml.quit())
+    };
+    let (quit_a, quit_b) = (quit_loop.clone(), quit_loop);
     let listener = stream
         .add_local_listener_with_user_data(state)
-        .param_changed(|stream, st, id, param| {
+        .param_changed(move |stream, st, id, param| {
             let Some(param) = param else { return };
             if id != ParamType::Format.as_raw() {
                 return;
@@ -251,23 +273,27 @@ where
             let Some(fourcc) = drm_fourcc(info.format()) else { return };
             let format =
                 StreamFormat { width: info.size().width, height: info.size().height, fourcc, modifier: has_modifier.then(|| info.modifier()) };
-            st.counters.dmabuf.store(has_modifier, Ordering::Relaxed);
-            st.format = Some(format);
-            st.sink.format(&format);
+            st.inner.counters.dmabuf.store(has_modifier, Ordering::Relaxed);
+            st.inner.format = Some(format);
+            st.sink.call(&*quit_a, |sink| sink.format(&format));
+            if st.sink.poisoned() {
+                return;
+            }
             let buffers = buffers_pod(has_modifier);
             let meta = meta_header_pod();
             let mut params = [Pod::from_bytes(&buffers).expect("pod"), Pod::from_bytes(&meta).expect("pod")];
             let _ = stream.update_params(&mut params);
         })
-        .process(|stream, st| {
+        .process(move |stream, st| {
             // SAFETY: dequeue returns null or a buffer owned by the stream until we queue it back below.
             let buf = unsafe { stream.dequeue_raw_buffer() };
             if buf.is_null() {
                 return;
             }
             let now = monotonic_ns();
-            // SAFETY: buf is a valid pw_buffer; its spa_buffer and datas stay valid until queued back.
-            unsafe { deliver(st, buf, now) };
+            // SAFETY: buf is a valid pw_buffer; its spa_buffer and datas stay valid until queued back. A panic in the
+            // sink is caught here (it must not unwind into PipeWire's C frames).
+            st.sink.call(&*quit_b, |sink| unsafe { deliver(&mut st.inner, &mut **sink, buf, now) });
             // SAFETY: the buffer came from this stream's dequeue and is given back once.
             unsafe { stream.queue_raw_buffer(buf) };
         })
@@ -299,7 +325,7 @@ where
 ///
 /// # Safety
 /// `buf` must be a dequeued, not yet queued pw_buffer of the stream.
-unsafe fn deliver(st: &mut State, buf: *mut pw::sys::pw_buffer, now: u64) {
+unsafe fn deliver(st: &mut Inner, sink: &mut dyn VideoSink, buf: *mut pw::sys::pw_buffer, now: u64) {
     // SAFETY: guaranteed by the caller.
     let spa_buf = unsafe { (*buf).buffer };
     if spa_buf.is_null() {
@@ -317,7 +343,7 @@ unsafe fn deliver(st: &mut State, buf: *mut pw::sys::pw_buffer, now: u64) {
     let chunk = unsafe { &*d0.chunk };
     if chunk.flags & spa::sys::SPA_CHUNK_FLAG_CORRUPTED as i32 != 0 || (chunk.size == 0 && d0.type_ != spa::sys::SPA_DATA_DmaBuf) {
         st.counters.skipped.fetch_add(1, Ordering::Relaxed);
-        st.sink.skipped();
+        sink.skipped();
         return;
     }
     match d0.type_ {
@@ -338,7 +364,7 @@ unsafe fn deliver(st: &mut State, buf: *mut pw::sys::pw_buffer, now: u64) {
                 planes: &st.planes,
             });
             st.counters.frames.fetch_add(1, Ordering::Relaxed);
-            st.sink.frame(&frame, now);
+            sink.frame(&frame, now);
         }
         spa::sys::SPA_DATA_MemFd | spa::sys::SPA_DATA_MemPtr => {
             if d0.data.is_null() {
@@ -351,7 +377,7 @@ unsafe fn deliver(st: &mut State, buf: *mut pw::sys::pw_buffer, now: u64) {
             let stride = if chunk.stride > 0 { chunk.stride as u32 } else { format.width * 4 };
             let frame = VideoFrame::Shm(ShmFrame { width: format.width, height: format.height, stride, fourcc: format.fourcc, data });
             st.counters.frames.fetch_add(1, Ordering::Relaxed);
-            st.sink.frame(&frame, now);
+            sink.frame(&frame, now);
         }
         _ => {
             st.counters.skipped.fetch_add(1, Ordering::Relaxed);

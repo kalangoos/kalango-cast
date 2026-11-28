@@ -6,6 +6,7 @@
 //! Every timestamp is `CLOCK_MONOTONIC` nanoseconds (see `cast_core::clock`).
 
 pub mod audio;
+pub mod guard;
 pub mod screencast;
 pub mod video;
 
