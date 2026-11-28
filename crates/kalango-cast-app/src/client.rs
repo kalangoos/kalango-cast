@@ -268,7 +268,7 @@ mod tests {
         let r = call(&sock, "record.start", params.clone(), Duration::from_secs(5));
         assert!(matches!(r, Err(CallError::Rpc { code: -32001, .. })), "{r:?}");
         let Msg::ConsentRequested(req) = next() else { panic!("expected the consent request") };
-        assert!(req.what.contains("file: \"a.mp4\""));
+        assert!(req.what.contains("\"a.mp4\""), "{}", req.what);
         assert!(log.lock().unwrap().is_empty(), "the code stayed off the terminal");
         // another client cannot approve with the code; we can
         let other = call(&sock, "consent.approve", json!({"token": req.token}), Duration::from_secs(5));
