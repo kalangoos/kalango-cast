@@ -111,6 +111,17 @@ A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, 
   quem apresenta o segredo do serviço (a janela que o iniciou) os recebe. Qualquer outro programa da mesma pessoa vê
   monitores e ids de janela, com título e `app_id` vazios (a menos que o serviço rode com consentimento `allow`).
   Decisão: não pedir aprovação a cada listagem, porque a janela lista ao abrir e ao atualizar.
+- **Panic na captura**: os callbacks do PipeWire (vídeo e som) rodam dentro de funções C; um panic ali abortaria o
+  processo inteiro. Cada callback passa por `catch_unwind` (`cast_capture::guard`): o panic vira falha da gravação
+  (`recording_failed` na hora, captura parada, o arquivo fica como a última fração completa) e o serviço continua de pé;
+  o mesmo vale para o corpo das threads de vídeo, som e escritor e para cada conexão do serviço. O que isto não cobre:
+  um `abort` do próprio driver ou da biblioteca em C (fora do Rust), e `panic = "abort"` se alguém o ligar no perfil.
+- **Encerramento**: `kalango-castd` ao receber SIGTERM/SIGINT para a gravação em curso; um início em andamento é
+  cancelado e **esperado por até 12 s** (`SHUTDOWN_WAIT`) antes de o serviço sair, e depois do encerramento nenhum
+  `record.start` é aceito. Se o início passar de 12 s, o serviço sai assim mesmo.
+- **Teste de `sources.list`**: a decisão sobre os títulos passa por `filter_sources` e é testada ponta a ponta pelo
+  `handle` com uma lista injetada (`Daemon::with_sources`); o que **não** tem teste automático é a chamada real ao
+  ScreenCast do compositor (precisa de D-Bus e de uma sessão), que só roda no teste `niri_session` (`#[ignore]`).
 - **Aprovação e erro do ambiente**: se o início falha por causa do ambiente (codificador, compositor, o tempo de 10 s),
   a aprovação já dada volta (vale o mesmo prazo), para a pessoa não ser perguntada de novo pelo mesmo pedido.
 - **Arquivo de saída** (a pasta precisa ser **sua**: `/tmp`, que é do root, é recusado, com o motivo na resposta;

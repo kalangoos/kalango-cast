@@ -325,6 +325,9 @@ impl Running for Recorder {
     }
 }
 
+/// What the compositor lists to record.
+pub type SourceList = Arc<dyn Fn() -> Result<cast_capture::Sources, String> + Send + Sync>;
+
 /// How the daemon starts a recording (the real one by default; tests plug a slow or failing one in).
 pub type Starter = Arc<dyn Fn(RecordOptions, FailNotify) -> Result<Box<dyn Running>, StartError> + Send + Sync>;
 
@@ -429,6 +432,8 @@ impl Core {
 pub struct Daemon {
     core: Arc<Core>,
     starter: Option<Starter>,
+    /// Where the list of sources comes from (the compositor by default; tests plug a fixed list in).
+    sources: Option<SourceList>,
     pending: Mutex<Option<Pending>>,
     pub dbus_address: Option<String>,
     pub consent: Consent,
@@ -454,6 +459,12 @@ impl Daemon {
         if let Some(core) = Arc::get_mut(&mut self.core) {
             core.hook = Some(hook);
         }
+        self
+    }
+
+    /// Replaces where the sources come from (tests).
+    pub fn with_sources(mut self, sources: SourceList) -> Self {
+        self.sources = Some(sources);
         self
     }
 
@@ -915,8 +926,13 @@ impl Daemon {
                 "consent_handler": self.core.handler.lock().map(|h| h.is_some()).unwrap_or(false),
             })),
             "sources.list" => {
-                let cast = cast_capture::ScreenCast::connect(self.dbus_address.as_deref()).map_err(|e| app(e.0))?;
-                let s = cast.sources().map_err(|e| app(e.0))?;
+                let s = match &self.sources {
+                    Some(list) => list().map_err(app)?,
+                    None => {
+                        let cast = cast_capture::ScreenCast::connect(self.dbus_address.as_deref()).map_err(|e| app(e.0))?;
+                        cast.sources().map_err(|e| app(e.0))?
+                    }
+                };
                 // window titles say what the person is doing: only the app that spawned this daemon (it holds the secret),
                 // or a daemon that was told to allow everything, hands them out
                 let s = self.filter_sources(params, s);
@@ -1615,6 +1631,23 @@ mod tests {
             assert!(!quote(hidden).chars().any(is_unsafe_char), "{hidden:?}");
         }
         assert!(plain("x", "Café 日本").is_ok());
+    }
+
+    #[test]
+    fn sources_list_end_to_end_hides_titles_from_whoever_lacks_the_secret() {
+        let list: SourceList = Arc::new(|| {
+            Ok(cast_capture::Sources {
+                monitors: vec![],
+                windows: vec![cast_capture::screencast::Window { id: 3, title: "Bank".into(), app_id: "firefox".into() }],
+            })
+        });
+        let title = |d: &Daemon, params: Value| call(d, "sources.list", params)["result"]["windows"][0]["title"].clone();
+        let ask = Daemon::default().with_consent(Consent::Ask).with_handler_secret(SECRET.into()).with_sources(list.clone());
+        assert_eq!(title(&ask, json!({})), "");
+        assert_eq!(title(&ask, json!({"secret": "wrong"})), "");
+        assert_eq!(title(&ask, json!({"secret": SECRET})), "Bank");
+        let allow = Daemon::default().with_consent(Consent::Allow).with_sources(list);
+        assert_eq!(title(&allow, json!({})), "Bank");
     }
 
     #[test]
