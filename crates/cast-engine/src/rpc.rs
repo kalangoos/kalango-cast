@@ -296,6 +296,13 @@ struct HandlerSlot {
 /// How long a pushed event may block on a handler that does not read before it is dropped as dead.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Locks, whatever happened to the lock's last holder: a thread that panicked must not make the daemon answer "lock"
+/// for ever (nor stop it from stopping the recording at exit). The data is plain state that every holder leaves
+/// consistent before it can fail.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A recording the daemon holds: a real [`Recorder`], or a stand-in in tests.
 pub trait Running: Send {
     fn status(&self) -> Status;
@@ -381,10 +388,10 @@ impl Core {
 
     /// Sends an event to the consent handler; a handler that cannot take it is dropped (the terminal takes over).
     fn push_to_handler(&self, e: &Event) -> bool {
-        let Ok(mut slot) = self.handler.lock() else { return false };
+        let mut slot = lock(&self.handler);
         let Some(h) = slot.as_ref() else { return false };
         let note = json!({"jsonrpc": "2.0", "method": "event", "params": event_json(e, self.ttl)});
-        let sent = h.out.lock().map(|mut out| writeln!(out, "{note}").is_ok()).unwrap_or(false);
+        let sent = writeln!(lock(&h.out), "{note}").is_ok();
         if !sent {
             *slot = None;
         }
@@ -394,7 +401,7 @@ impl Core {
     /// Recording `id` failed for good (its writer thread says so): tell the person now, and stop its capture.
     fn recording_failed(self: &Arc<Self>, id: u64, error: String) {
         let (path, halt) = {
-            let Ok(mut slot) = self.slot.lock() else { return };
+            let mut slot = lock(&self.slot);
             match &mut *slot {
                 Slot::Starting { id: i, failed, .. } if *i == id => {
                     failed.get_or_insert(error.clone());
@@ -478,7 +485,7 @@ impl Daemon {
     /// Whether `ctx` may approve or deny: with a handler registered, only its connection; otherwise anyone who
     /// holds the code (the terminal flow).
     fn may_decide(&self, ctx: Option<&ConnCtx>) -> Result<(), RpcError> {
-        let slot = self.core.handler.lock().map_err(|_| (-32000, "lock".to_string()))?;
+        let slot = lock(&self.core.handler);
         match (slot.as_ref(), ctx) {
             (None, _) => Ok(()),
             (Some(h), Some(c)) if h.conn == c.id => Ok(()),
@@ -507,19 +514,17 @@ impl Daemon {
         // before anything is handed over or the terminal is silenced
         self.authenticate(params)?;
         {
-            let mut slot = self.core.handler.lock().map_err(|_| (-32000, "lock".to_string()))?;
+            let mut slot = lock(&self.core.handler);
             if let Some(h) = slot.as_ref() {
                 if h.conn != ctx.id {
                     return Err((NOT_HANDLER, tr("A consent handler is already registered").to_string()));
                 }
             }
-            if let Ok(out) = ctx.out.lock() {
-                let _ = out.set_write_timeout(Some(PUSH_TIMEOUT));
-            }
+            let _ = lock(&ctx.out).set_write_timeout(Some(PUSH_TIMEOUT));
             *slot = Some(HandlerSlot { conn: ctx.id, out: ctx.out.clone() });
         }
         // a request that was held before the UI registered is handed over now (the terminal's notice stands too)
-        let waiting = self.pending.lock().ok().and_then(|p| {
+        let waiting = Some(lock(&self.pending)).and_then(|p| {
             p.as_ref().filter(|p| !p.approved && p.created.elapsed() <= self.limits.ttl).map(|p| Event::ConsentRequested {
                 what: p.what.clone(),
                 token: p.token.clone(),
@@ -534,10 +539,9 @@ impl Daemon {
 
     /// The connection ended: it stops being the handler.
     fn connection_closed(&self, id: u64) {
-        if let Ok(mut slot) = self.core.handler.lock() {
-            if slot.as_ref().is_some_and(|h| h.conn == id) {
-                *slot = None;
-            }
+        let mut slot = lock(&self.core.handler);
+        if slot.as_ref().is_some_and(|h| h.conn == id) {
+            *slot = None;
         }
     }
 }
@@ -780,7 +784,9 @@ impl Daemon {
         if self.consent == Consent::Allow {
             return Ok(None);
         }
-        let mut slot = self.pending.lock().map_err(|_| (-32000, "lock".to_string()))?;
+        let mut slot = lock(&self.pending);
+        // events go out after the lock is released: the hook is somebody else's code (a terminal that may not take it)
+        let mut events = Vec::new();
         if let Some(p) = slot.as_ref() {
             if p.created.elapsed() > self.limits.ttl {
                 *slot = None;
@@ -797,7 +803,7 @@ impl Daemon {
             _ => {
                 // a different request replaces the held one: never silently, the handler is told which one died
                 if let Some(old) = slot.as_ref().filter(|p| !p.approved) {
-                    self.emit(Event::ConsentSuperseded { request_id: old.id.clone() });
+                    events.push(Event::ConsentSuperseded { request_id: old.id.clone() });
                 }
                 let token = new_token()?;
                 let id = new_token()?[..16].to_string();
@@ -811,11 +817,15 @@ impl Daemon {
                     wrong: 0,
                     restored: false,
                 });
-                self.emit(Event::ConsentRequested { what, token, request_id: id });
+                events.push(Event::ConsentRequested { what, token, request_id: id });
             }
         }
         // the id travels in the error's data (see `handle_from`)
         let id = slot.as_ref().map(|p| p.id.clone()).unwrap_or_default();
+        drop(slot);
+        for e in events {
+            self.emit(e);
+        }
         Err((CONSENT_REQUIRED, format!("consent_required{ID_MARK}{id}")))
     }
 
@@ -844,7 +854,8 @@ impl Daemon {
             return;
         }
         let (Ok(token), Ok(id)) = (new_token(), new_token()) else { return };
-        if let Ok(mut slot) = self.pending.lock() {
+        {
+            let mut slot = lock(&self.pending);
             if slot.is_none() {
                 *slot = Some(Pending {
                     token,
@@ -863,7 +874,7 @@ impl Daemon {
     fn approve(&self, params: &Value) -> Result<Value, RpcError> {
         let token = params.get("token").and_then(|t| t.as_str()).ok_or((-32602, "token".to_string()))?;
         let invalid = || (-32002, tr("Invalid or expired approval code").to_string());
-        let mut slot = self.pending.lock().map_err(|_| (-32000, "lock".to_string()))?;
+        let mut slot = lock(&self.pending);
         let p = slot.as_mut().ok_or_else(invalid)?;
         if p.created.elapsed() > self.limits.ttl {
             *slot = None;
@@ -883,7 +894,7 @@ impl Daemon {
     /// The person said no: the held request is dropped (a new `record.start` asks again, with a new code).
     fn deny(&self, params: &Value) -> Result<Value, RpcError> {
         let token = params.get("token").and_then(|t| t.as_str()).ok_or((-32602, "token".to_string()))?;
-        let mut slot = self.pending.lock().map_err(|_| (-32000, "lock".to_string()))?;
+        let mut slot = lock(&self.pending);
         match slot.as_ref() {
             Some(p) if p.token == token && p.created.elapsed() <= self.limits.ttl => {
                 *slot = None;
@@ -931,7 +942,7 @@ impl Daemon {
                 let (fp, what) = (fingerprint(&o), describe_with(&o, window.as_ref().map(|(a, t)| (a.as_str(), t.as_str()))));
                 // a recording that failed is over: tell, then make room for a new one (stopped outside the lock)
                 let failed = {
-                    let mut slot = self.core.slot.lock().map_err(|_| app("lock".into()))?;
+                    let mut slot = lock(&self.core.slot);
                     match std::mem::take(&mut *slot) {
                         Slot::Idle => None,
                         s @ Slot::Starting { .. } => {
@@ -957,7 +968,7 @@ impl Daemon {
                 let used = self.check_consent(fp.clone(), what.clone())?;
                 // the slow part (the compositor, the encoder, up to 10 s) runs with no lock held
                 let (id, cancel) = {
-                    let mut slot = self.core.slot.lock().map_err(|_| app("lock".into()))?;
+                    let mut slot = lock(&self.core.slot);
                     if !matches!(*slot, Slot::Idle) {
                         drop(slot);
                         let _ = (fp, what, used);
@@ -979,7 +990,7 @@ impl Daemon {
                     None => Recorder::start_notify(o, notify).map(|r| Box::new(r) as Box<dyn Running>),
                 }))
                 .unwrap_or_else(|_| Err(StartError::environment(tr("The start failed unexpectedly"))));
-                let mut slot = self.core.slot.lock().map_err(|_| app("lock".into()))?;
+                let mut slot = lock(&self.core.slot);
                 let early_failure = match &mut *slot {
                     Slot::Starting { failed, .. } => failed.take(),
                     _ => None,
@@ -1021,7 +1032,7 @@ impl Daemon {
                 out
             }
             "record.status" => {
-                let slot = self.core.slot.lock().map_err(|_| app("lock".into()))?;
+                let slot = lock(&self.core.slot);
                 match &*slot {
                     Slot::Idle => Ok(json!({"recording": false})),
                     Slot::Starting { .. } => Ok(json!({"recording": false, "starting": true})),
@@ -1030,7 +1041,7 @@ impl Daemon {
             }
             "record.stop" => {
                 let (rec, notified) = {
-                    let mut slot = self.core.slot.lock().map_err(|_| app("lock".into()))?;
+                    let mut slot = lock(&self.core.slot);
                     match std::mem::take(&mut *slot) {
                         Slot::Idle => return Err(app(tr("No recording is running").into())),
                         s @ Slot::Starting { .. } => {
@@ -1086,7 +1097,8 @@ impl Daemon {
             let d = self.clone();
             let cred = peer_cred(&conn);
             let spawned = std::thread::Builder::new().name("cast-rpc".into()).spawn(move || {
-                d.client(conn, cred);
+                // the connection's end is counted whatever happens in it (a panic must not leak the slot)
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.client(conn, cred)));
                 d.active.fetch_sub(1, Ordering::AcqRel);
             });
             if spawned.is_err() {
@@ -1099,7 +1111,8 @@ impl Daemon {
         let Ok(clone) = conn.try_clone() else { return };
         let out: SharedOut = Arc::new(Mutex::new(clone));
         let ctx = ConnCtx { id: self.next_conn.fetch_add(1, Ordering::Relaxed), uid: cred.map(|c| c.1), out: out.clone() };
-        self.serve_connection(conn, &ctx);
+        // a panic while serving ends this connection only, and it stops being the handler
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.serve_connection(conn, &ctx)));
         self.connection_closed(ctx.id);
     }
 
@@ -1115,9 +1128,7 @@ impl Daemon {
             }
             let ends = buf.last() == Some(&b'\n');
             if buf.len() - usize::from(ends) > self.limits.line {
-                if let Ok(mut o) = ctx.out.lock() {
-                    let _ = writeln!(o, "{}", error(&Value::Null, -32600, tr("Request too long")));
-                }
+                let _ = writeln!(lock(&ctx.out), "{}", error(&Value::Null, -32600, tr("Request too long")));
                 break;
             }
             let line = String::from_utf8_lossy(&buf);
@@ -1125,7 +1136,7 @@ impl Daemon {
                 continue;
             }
             if let Some(reply) = self.handle_from(Some(ctx), &line) {
-                let ok = ctx.out.lock().map(|mut o| writeln!(o, "{reply}").is_ok()).unwrap_or(false);
+                let ok = writeln!(lock(&ctx.out), "{reply}").is_ok();
                 if !ok {
                     break;
                 }
@@ -1137,7 +1148,7 @@ impl Daemon {
     /// [`SHUTDOWN_WAIT`]), so the file it opened is closed, or removed when empty, before the process goes.
     pub fn shutdown(&self) {
         let rec = {
-            let Ok(mut slot) = self.core.slot.lock() else { return };
+            let mut slot = lock(&self.core.slot);
             match std::mem::take(&mut *slot) {
                 Slot::Running { rec, .. } => Some(rec),
                 s @ Slot::Starting { .. } => {
@@ -1507,6 +1518,81 @@ mod tests {
             again["error"]["message"].as_str().is_some_and(|m| m == "no encoder"),
             "the failed one was discarded and the starter ran again: {again}"
         );
+    }
+
+    fn poison<T: Send>(m: &Mutex<T>) {
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _g = m.lock().unwrap();
+                    panic!("a holder died");
+                })
+                .join();
+        });
+        assert!(m.is_poisoned());
+    }
+
+    #[test]
+    fn a_poisoned_lock_does_not_make_the_daemon_useless_and_shutdown_still_stops_the_recording() {
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let fake = Fake { path: "/x/a.mp4".into(), stopped: stopped.clone(), ..Fake::default() };
+        let (d, _log) = slow_daemon(Duration::ZERO, fake, Arc::default());
+        assert!(call(&d, "record.start", start_params(Path::new("/x/a.mp4"))).get("error").is_none());
+        poison(&d.core.slot);
+        poison(&d.core.handler);
+        poison(&d.pending);
+        let st = call(&d, "record.status", json!({}));
+        assert!(st.get("result").is_some(), "{st}");
+        d.shutdown();
+        assert_eq!(stopped.load(Ordering::SeqCst), 1, "the recording in progress is stopped even after a lock was poisoned");
+    }
+
+    #[test]
+    fn a_poisoned_consent_lock_still_asks() {
+        let (d, _log) = daemon(Consent::Ask);
+        poison(&d.pending);
+        let r = start(&d, &start_params(&scratch("poison").join("a.mp4")));
+        assert_eq!(r["error"]["code"], CONSENT_REQUIRED, "{r}");
+    }
+
+    #[test]
+    fn the_hook_runs_with_no_consent_lock_held() {
+        let d = Arc::new(Daemon::default().with_consent(Consent::Ask).with_hook(Box::new(|e| {
+            if matches!(e, Event::ConsentRequested { .. }) {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        })));
+        let d2 = d.clone();
+        let params = start_params(&scratch("hooklock").join("a.mp4"));
+        let h = std::thread::spawn(move || start(&d2, &params));
+        std::thread::sleep(Duration::from_millis(150));
+        let t0 = Instant::now();
+        let r = approve(&d, "0000");
+        assert!(t0.elapsed() < Duration::from_millis(150), "the approval waited {:?} on a hook", t0.elapsed());
+        assert_eq!(r["error"]["code"], -32002);
+        let _ = h.join();
+    }
+
+    #[test]
+    fn a_panic_while_serving_a_connection_does_not_leak_its_slot() {
+        let dir = scratch("leak");
+        let sock = dir.join("kalango").join("cast.sock");
+        let listener = bind(&sock).unwrap();
+        let d = Arc::new(
+            Daemon::default()
+                .with_limits(Limits { connections: 1, ..Limits::default() })
+                .with_consent(Consent::Ask)
+                .with_hook(Box::new(|_| panic!("the terminal broke"))),
+        );
+        std::thread::spawn(move || d.serve(listener));
+        let mut c = UnixStream::connect(&sock).unwrap();
+        writeln!(c, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "record.start", "params": start_params(&dir.join("a.mp4"))})).unwrap();
+        let mut rest = String::new();
+        let _ = c.read_to_string(&mut rest);
+        // the connection died with the panic; its slot is free for the next one
+        let mut c = UnixStream::connect(&sock).unwrap();
+        writeln!(c, r#"{{"jsonrpc":"2.0","id":1,"method":"record.status"}}"#).unwrap();
+        assert_eq!(read_reply(&c)["result"]["recording"], false);
     }
 
     #[test]
