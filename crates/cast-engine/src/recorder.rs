@@ -20,6 +20,25 @@ use crate::stats::{self, Counters, Nvml, Status};
 /// Called (from the writer thread) the moment a recording fails for good, with why.
 pub type FailNotify = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Why a start failed: the request or the output file (the person's side: validation, path, permission), or the
+/// environment (the encoder, the compositor, the start timeout), which a retry of the same request may get past.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartError {
+    pub message: String,
+    /// Failed after the output file was opened, for reasons outside the request.
+    pub environment: bool,
+}
+
+impl StartError {
+    pub fn request(message: impl Into<String>) -> Self {
+        StartError { message: message.into(), environment: false }
+    }
+
+    pub fn environment(message: impl Into<String>) -> Self {
+        StartError { message: message.into(), environment: true }
+    }
+}
+
 /// A sound to record: the default device, a named one, or none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(untagged)]
@@ -509,28 +528,31 @@ fn audio_outcome<T>(started: Result<T, cast_capture::CaptureError>) -> (Option<T
 impl Recorder {
     /// Starts recording; returns once the encoder is running (or with why it could not start).
     pub fn start(options: RecordOptions) -> Result<Recorder, String> {
-        Self::start_notify(options, Arc::new(|_| {}))
+        Self::start_notify(options, Arc::new(|_| {})).map_err(|e| e.message)
     }
 
     /// Like [`Recorder::start`]; `notify` is called when the recording fails later (a full disk).
-    pub fn start_notify(options: RecordOptions, notify: FailNotify) -> Result<Recorder, String> {
+    pub fn start_notify(options: RecordOptions, notify: FailNotify) -> Result<Recorder, StartError> {
         if !options.path.is_absolute() {
-            return Err(tr("The path must be absolute").into());
+            return Err(StartError::request(tr("The path must be absolute")));
         }
         if options.path.parent().is_none_or(|p| !p.is_dir()) {
-            return Err(trf("The folder {path} does not exist", &[("path", options.path.parent().unwrap_or(&options.path).display().to_string())]));
+            return Err(StartError::request(trf(
+                "The folder {path} does not exist",
+                &[("path", options.path.parent().unwrap_or(&options.path).display().to_string())],
+            )));
         }
         // the file is opened (safely, exclusively) before anything else is started: a path that cannot be written
         // fails here, not minutes into a recording
         let file = cast_mux::open_output(&options.path, options.overwrite).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
+            StartError::request(if e.kind() == std::io::ErrorKind::AlreadyExists {
                 tr("The file already exists").to_string()
             } else {
                 format!("{}: {e}", options.path.display())
-            }
+            })
         })?;
         let path = options.path.clone();
-        Self::start_with_file(options, file, notify).inspect_err(|_| {
+        Self::start_with_file(options, file, notify).map_err(StartError::environment).inspect_err(|_| {
             // nothing was recorded: do not leave an empty file behind
             if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
                 let _ = std::fs::remove_file(&path);

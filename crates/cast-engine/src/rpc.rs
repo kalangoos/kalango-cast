@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use cast_core::{tr, trf, Source};
 use serde_json::{json, Value};
 
-use crate::recorder::{AudioChoice, FailNotify, RecordOptions, Recorder};
+use crate::recorder::{AudioChoice, FailNotify, RecordOptions, Recorder, StartError};
 use crate::stats::Status;
 
 /// The longest request line served (bytes, without the newline).
@@ -265,6 +265,16 @@ struct Pending {
     created: Instant,
     approved: bool,
     wrong: u32,
+    /// This approval was given back once already (after a start that failed for the environment): never twice.
+    restored: bool,
+}
+
+/// What a used-up approval was, to give it back after an environment failure.
+#[derive(Clone, Copy)]
+struct Approval {
+    /// When the person gave it (the first approval's clock; a restore does not renew it).
+    created: Instant,
+    restored: bool,
 }
 
 /// The write side of a connection, shared between its own thread (replies) and the daemon (pushed events).
@@ -307,7 +317,7 @@ impl Running for Recorder {
 }
 
 /// How the daemon starts a recording (the real one by default; tests plug a slow or failing one in).
-pub type Starter = Arc<dyn Fn(RecordOptions, FailNotify) -> Result<Box<dyn Running>, String> + Send + Sync>;
+pub type Starter = Arc<dyn Fn(RecordOptions, FailNotify) -> Result<Box<dyn Running>, StartError> + Send + Sync>;
 
 /// The one recording's state. Starting is a state of its own so the slow part runs without the lock: `record.status`
 /// and `record.stop` answer while a start is under way.
@@ -740,9 +750,9 @@ impl Daemon {
 
     /// Holds a request until the person approves it, or lets it through when it was approved (once) or consent is
     /// not asked for.
-    fn check_consent(&self, fingerprint: String, what: String) -> Result<(), RpcError> {
+    fn check_consent(&self, fingerprint: String, what: String) -> Result<Option<Approval>, RpcError> {
         if self.consent == Consent::Allow {
-            return Ok(());
+            return Ok(None);
         }
         let mut slot = self.pending.lock().map_err(|_| (-32000, "lock".to_string()))?;
         if let Some(p) = slot.as_ref() {
@@ -752,8 +762,9 @@ impl Daemon {
         }
         match slot.as_ref() {
             Some(p) if p.approved && p.fingerprint == fingerprint => {
+                let used = Approval { created: p.created, restored: p.restored };
                 *slot = None;
-                return Ok(());
+                return Ok(Some(used));
             }
             // asked already, still waiting: no new code, no new notice
             Some(p) if !p.approved && p.fingerprint == fingerprint => {}
@@ -772,6 +783,7 @@ impl Daemon {
                     created: Instant::now(),
                     approved: false,
                     wrong: 0,
+                    restored: false,
                 });
                 self.emit(Event::ConsentRequested { what, token, request_id: id });
             }
@@ -781,15 +793,27 @@ impl Daemon {
         Err((CONSENT_REQUIRED, format!("consent_required{ID_MARK}{id}")))
     }
 
-    /// Gives back the approval `check_consent` used up, for a start the person's choice did not cause to fail.
-    fn restore_approval(&self, fingerprint: String, what: String) {
-        if self.consent == Consent::Allow {
+    /// Gives back the approval `check_consent` used up, after a start that failed for the environment once the output
+    /// file was open. At most once per approval, never past the first approval's own deadline (the clock is not reset),
+    /// and never for a different request than the one approved.
+    fn restore_approval(&self, fingerprint: String, what: String, used: Option<Approval>) {
+        let Some(used) = used else { return };
+        if used.restored || used.created.elapsed() > self.limits.ttl {
             return;
         }
         let (Ok(token), Ok(id)) = (new_token(), new_token()) else { return };
         if let Ok(mut slot) = self.pending.lock() {
             if slot.is_none() {
-                *slot = Some(Pending { token, id: id[..16].to_string(), what, fingerprint, created: Instant::now(), approved: true, wrong: 0 });
+                *slot = Some(Pending {
+                    token,
+                    id: id[..16].to_string(),
+                    what,
+                    fingerprint,
+                    created: used.created,
+                    approved: true,
+                    wrong: 0,
+                    restored: true,
+                });
             }
         }
     }
@@ -886,13 +910,13 @@ impl Daemon {
                     }
                     let _ = rec.stop();
                 }
-                self.check_consent(fp.clone(), what.clone())?;
+                let used = self.check_consent(fp.clone(), what.clone())?;
                 // the slow part (the compositor, the encoder, up to 10 s) runs with no lock held
                 let (id, cancel) = {
                     let mut slot = self.core.slot.lock().map_err(|_| app("lock".into()))?;
                     if !matches!(*slot, Slot::Idle) {
                         drop(slot);
-                        self.restore_approval(fp, what);
+                        let _ = (fp, what, used);
                         return Err(app(tr("A recording is already starting").into()));
                     }
                     let id = self.core.next_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -937,10 +961,10 @@ impl Daemon {
                         drop(slot);
                         // the environment failed (the encoder, the compositor), not the request: the approval stands, so
                         // a retry does not ask the person again
-                        if !cancelled {
-                            self.restore_approval(fp, what);
+                        if !cancelled && e.environment {
+                            self.restore_approval(fp, what, used);
                         }
-                        Err(app(e))
+                        Err(app(e.message))
                     }
                 }
             }
@@ -1164,7 +1188,7 @@ mod tests {
             Arc::new(move |_, notify| {
                 std::thread::sleep(delay);
                 *notify_out.lock().unwrap() = Some(notify);
-                fake.lock().unwrap().take().map(|f| Box::new(f) as Box<dyn Running>).ok_or_else(|| "no encoder".to_string())
+                fake.lock().unwrap().take().map(|f| Box::new(f) as Box<dyn Running>).ok_or_else(|| StartError::environment("no encoder"))
             }),
         );
         (Arc::new(d), log)
@@ -1233,20 +1257,57 @@ mod tests {
         assert_eq!(n, 1, "{:?}", log.lock().unwrap());
     }
 
-    #[test]
-    fn a_start_that_fails_for_the_environment_keeps_the_approval() {
+    /// An approved request whose start fails with `error` after `delay`; returns the daemon and its params.
+    fn approved_start(ttl: Duration, delay: Duration, error: StartError, name: &str) -> (Daemon, Value) {
         let (d, log) = daemon(Consent::Ask);
-        let d = d.with_starter(Arc::new(|_, _| Err("no encoder".to_string())));
-        let params = start_params(&scratch("approval").join("a.mp4"));
+        let d = d.with_limits(Limits { ttl, ..Limits::default() }).with_starter(Arc::new(move |_, _| {
+            std::thread::sleep(delay);
+            Err(error.clone())
+        }));
+        let params = start_params(&scratch(name).join("a.mp4"));
         assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED);
         assert_eq!(approve(&d, &token_of(&log))["result"]["approved"], true);
-        let r = start(&d, &params);
-        assert!(r["error"]["message"].as_str().unwrap().contains("no encoder"), "{r}");
-        let again = start(&d, &params);
-        assert!(again["error"]["message"].as_str().unwrap().contains("no encoder"), "asked for approval again: {again}");
-        // a different request is not covered by it
-        let other = start_params(&scratch("approval").join("b.mp4"));
+        (d, params)
+    }
+
+    fn message(r: &Value) -> String {
+        r["error"]["message"].as_str().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn an_environment_failure_gives_the_approval_back_once() {
+        let (d, params) = approved_start(Duration::from_secs(60), Duration::ZERO, StartError::environment("no encoder"), "env-once");
+        assert_eq!(message(&start(&d, &params)), "no encoder");
+        assert_eq!(message(&start(&d, &params)), "no encoder", "the restored approval is used: no new question");
+        assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED, "a second failure is not given back again");
+        // a different request is never covered by it
+        let other = start_params(&scratch("env-once").join("b.mp4"));
         assert_eq!(start(&d, &other)["error"]["code"], CONSENT_REQUIRED);
+    }
+
+    #[test]
+    fn a_failure_of_the_request_or_the_file_does_not_give_the_approval_back() {
+        let (d, params) = approved_start(Duration::from_secs(60), Duration::ZERO, StartError::request("The file already exists"), "request");
+        assert_eq!(message(&start(&d, &params)), "The file already exists");
+        assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED, "asks again");
+    }
+
+    #[test]
+    fn a_restored_approval_keeps_the_first_deadline() {
+        let ttl = Duration::from_millis(700);
+        let (d, params) = approved_start(ttl, Duration::from_millis(400), StartError::environment("no encoder"), "deadline");
+        assert_eq!(message(&start(&d, &params)), "no encoder");
+        // 400 ms in the first start, 400 ms here: past the first approval's 700 ms, though not past 700 ms from the restore
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED, "the clock was not reset by the restore");
+    }
+
+    #[test]
+    fn an_approval_that_expired_during_the_start_is_not_restored() {
+        let ttl = Duration::from_millis(300);
+        let (d, params) = approved_start(ttl, Duration::from_millis(600), StartError::environment("timeout"), "expired");
+        assert_eq!(message(&start(&d, &params)), "timeout");
+        assert_eq!(start(&d, &params)["error"]["code"], CONSENT_REQUIRED);
     }
 
     #[test]
