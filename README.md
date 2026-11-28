@@ -35,6 +35,13 @@ O código compila e passa no `clippy -D warnings` e nos testes de unidade. Pouco
 
 Testes que dependem de máquina, rede ou compositor são `#[ignore]` e dizem a variável de ambiente que os liga:
 `KALANGO_CAST_GPU` (NVENC), `KALANGO_CAST_OPENH264_NET` (download), `KALANGO_CAST_NIRI` (sessão completa) e `KALANGO_CASTD` (a janela iniciando o `kalango-castd` de verdade como processo filho).
+**Tentativa de gravação ponta a ponta (2026-11-27)**: o niri com o patch 0012 foi compilado e o teste `niri_session` foi
+rodado num Xvfb (`:99`). Duas coisas do próprio teste foram corrigidas (a configuração KDL não era aceita pelo niri 26.04, e
+faltava `debug { dbus-interfaces-in-non-session-instances }` para o niri aninhado servir `org.gnome.Mutter.*`); a sessão
+sobe e o ScreenCast é encontrado. **Bloqueio**: o Xvfb não tem DRI3 nem nó de renderização, o niri responde
+"error starting screencast: no GBM device available" e a gravação falha com "O compositor não entregou o fluxo.". Falta
+uma sessão com GPU de verdade (display real ou DRM headless), então o motor continua **prévia**.
+
 A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, não o que foi verificado.
 
 ## O que o código foi escrito para fazer

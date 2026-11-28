@@ -30,11 +30,32 @@ pub struct NestedNiri {
 }
 
 const CONFIG: &str = r#"
-input { keyboard { xkb { layout "us"; } } }
+input {
+    keyboard {
+        xkb {
+            layout "us"
+        }
+    }
+}
 prefer-no-csd
-animations { off; }
-hotkey-overlay { skip-at-startup; }
-layout { gaps 0; focus-ring { off; } border { off; } }
+debug {
+    dbus-interfaces-in-non-session-instances
+}
+animations {
+    off
+}
+hotkey-overlay {
+    skip-at-startup
+}
+layout {
+    gaps 0
+    focus-ring {
+        off
+    }
+    border {
+        off
+    }
+}
 spawn-at-startup "sh" "-c" "env > @ENV@.part && mv @ENV@.part @ENV@"
 "#;
 
