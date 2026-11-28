@@ -96,8 +96,16 @@ A lista abaixo ("O que já faz") é o que o código **foi escrito para fazer**, 
   diferente que troca um pedido sem resposta **não é silencioso**: o tratador recebe `consent_superseded` (e o
   terminal, se não há tratador).
 - **Indicador**: o daemon avisa início, fim e falha da gravação ao `Hook` (impresso no terminal do `kalango-castd`)
-  e à janela registrada; a **janela tem um indicador sempre visível** (ponto vermelho e cronômetro no alto, fora de
+  e à janela registrada. A falha é avisada **no momento em que o escritor a vê** (disco cheio, por exemplo), sem
+  esperar um `record.stop`, e a captura de vídeo e de som é parada ali; descartar uma gravação falha no `record.start`
+  seguinte não repete o aviso. A **janela tem um indicador sempre visível** (ponto vermelho e cronômetro no alto, fora de
   qualquer rolagem). **Não há indicador do sistema (ilha da barra) nem sinal D-Bus ainda.**
+- **`sources.list` e títulos de janela**: o título e o `app_id` das janelas dizem o que a pessoa está fazendo; só
+  quem apresenta o segredo do serviço (a janela que o iniciou) os recebe. Qualquer outro programa da mesma pessoa vê
+  monitores e ids de janela, com título e `app_id` vazios (a menos que o serviço rode com consentimento `allow`).
+  Decisão: não pedir aprovação a cada listagem, porque a janela lista ao abrir e ao atualizar.
+- **Aprovação e erro do ambiente**: se o início falha por causa do ambiente (codificador, compositor, o tempo de 10 s),
+  a aprovação já dada volta (vale o mesmo prazo), para a pessoa não ser perguntada de novo pelo mesmo pedido.
 - **Arquivo de saída** (a pasta precisa ser **sua**: `/tmp`, que é do root, é recusado, com o motivo na resposta;
   use por exemplo `~/Videos`): criado com `O_EXCL|O_NOFOLLOW` (modo 0600) numa pasta que seja sua e não seja um link; só
   termina em `.mp4`, sem `..`; `overwrite` só troca uma gravação nossa anterior (arquivo comum seu, com um só nome,
@@ -150,7 +158,8 @@ target/release/kalango-cast rpc record.stop
 ```
 
 Métodos do serviço: `capabilities`, `sources.list`, `record.start` (`source`, `path`, e opcionais `encoder`,
-`codec`, `fps`, `bitrate_kbps`, `desktop_audio`, `mic`, `overwrite`), `record.status` (quadros por segundo,
+`codec`, `fps`, `bitrate_kbps`, `desktop_audio`, `mic`, `cursor`, `overwrite`; um campo de tipo errado é recusado), `record.status`
+(durante um início lento responde `starting: true`, e `record.stop` cancela esse início; fora isso: quadros por segundo,
 perdidos, codificador, latência, taxa de bits, CPU, GPU), `record.stop`, e o consentimento: `consent.approve` e
 `consent.deny` (`token`) e `consent.handler.register` (para a janela; veja "Privacidade e consentimento").
 
